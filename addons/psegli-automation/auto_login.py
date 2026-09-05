@@ -390,7 +390,7 @@ class PSEGAutoLogin:
                                     sms_clicked = True
                                     break
                         if not sms_clicked:
-                            _LOGGER.warning("⚠️ SMS option not found - saving page to mfa_page_debug.html for debug")
+                            _LOGGER.warning("⚠️ SMS option not found; checking for email verification")
                             try:
                                 debug_content = await self.page.content()
                                 with open("mfa_page_debug.html", "w", encoding="utf-8") as f:
@@ -411,6 +411,8 @@ class PSEGAutoLogin:
                         'a:has-text("Send Code")',
                         'input[value="Email me a code"]',
                         'button:has-text("Email me a code")',
+                        'button[data-se="save"]:has-text("Send me an email")',
+                        'button:has-text("Send me an email")',
                         'input[value="Text me a code"]',
                         'button:has-text("Text me a code")',
                     ]

@@ -26,6 +26,7 @@ if HEADED:
 
 # Store in-progress MFA session (single session at a time)
 _mfa_session: Optional[PSEGAutoLogin] = None
+_mfa_lock = asyncio.Lock()
 
 class LoginRequest(BaseModel):
     username: str
@@ -96,31 +97,38 @@ async def login(request: LoginRequest):
 async def login_mfa(request: MfaRequest):
     """Complete login after MFA - provide the verification code from your email or SMS."""
     global _mfa_session
-    if not _mfa_session:
+    if _mfa_lock.locked():
         return LoginResponse(
             success=False,
-            error="No MFA session in progress. Call POST /login first, then provide the code from your email or phone here."
+            error="MFA verification is already in progress. Wait for the first request to finish."
         )
-    try:
-        logger.info("Completing MFA with provided code")
-        cookies = await _mfa_session.continue_after_mfa(request.code)
-        await _mfa_session.cleanup()
-        _mfa_session = None
-        
-        if cookies:
-            logger.info("MFA successful, cookies obtained")
-            return LoginResponse(success=True, cookies=cookies)
-        else:
+
+    async with _mfa_lock:
+        session = _mfa_session
+        if not session:
+            return LoginResponse(
+                success=False,
+                error="No MFA session in progress. Call POST /login first, then provide the code from your email or phone here."
+            )
+
+        try:
+            logger.info("Completing MFA with provided code")
+            cookies = await session.continue_after_mfa(request.code)
+
+            if cookies:
+                logger.info("MFA successful, cookies obtained")
+                return LoginResponse(success=True, cookies=cookies)
             return LoginResponse(success=False, error="MFA verification failed - code may be invalid or expired")
-    except Exception as e:
-        logger.error(f"MFA error: {e}")
-        if _mfa_session:
+        except Exception as e:
+            logger.error(f"MFA error: {e}")
+            return LoginResponse(success=False, error=str(e))
+        finally:
+            if _mfa_session is session:
+                _mfa_session = None
             try:
-                await _mfa_session.cleanup()
-            except Exception:
-                pass
-            _mfa_session = None
-        return LoginResponse(success=False, error=str(e))
+                await session.cleanup()
+            except Exception as cleanup_error:
+                logger.warning(f"MFA cleanup failed: {cleanup_error}")
 
 @app.post("/login-form", response_model=LoginResponse)
 async def login_form(
