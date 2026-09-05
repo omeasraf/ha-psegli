@@ -6,18 +6,18 @@ labels:
   io.hass.type: addon
   io.hass.version: "1.0.0"
 args:
-  PLAYWRIGHT_VERSION: "1.54.0"
-  PYTHON_VERSION: "3.11"
+  PLAYWRIGHT_VERSION: "1.62.0"
+  PYTHON_VERSION: "3.14"
 targets:
   psegli-automation:
     args:
-      PLAYWRIGHT_VERSION: "1.54.0"
-      PYTHON_VERSION: "3.11"
+      PLAYWRIGHT_VERSION: "1.62.0"
+      PYTHON_VERSION: "3.14"
     tags:
       - "ghcr.io/add-ons/psegli-automation:latest"
       - "ghcr.io/add-ons/psegli-automation:1.0.0"
       - "ghcr.io/add-ons/psegli-automation:{{ VERSION }}"
-    base: python:3.11-slim
+    base: python:3.14-slim
     platforms:
       - linux/amd64
       - linux/arm64
