@@ -224,7 +224,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 
         except InvalidAuth as e:
             _LOGGER.error("Authentication failed during update: %s", e)
-            _LOGGER.debug("Cookie refresh will be attempted at the next scheduled time (XX:00 or XX:30)")
+            _LOGGER.debug("Cookie refresh will be attempted at the next scheduled time (every 10 minutes)")
             
         except Exception as e:
             _LOGGER.error("Failed to update statistics: %s", e)
@@ -427,10 +427,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         async_enter_mfa_code
     )
     
-    # Set up scheduled cookie refresh at XX:00 and XX:30
+    # Set up scheduled cookie keepalive and refresh every 10 minutes
     async def async_scheduled_cookie_refresh() -> None:
-        """Automatically refresh cookies at scheduled times (XX:00 and XX:30).
-        Only refreshes when the current cookie is invalid - avoids MFA on every run.
+        """Automatically refresh cookies and keep session alive every 10 minutes.
+        Only refreshes via addon when the current cookie is invalid - avoids redundant logins.
         """
         _LOGGER.debug("Scheduled cookie refresh triggered")
         
@@ -525,20 +525,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:
             _LOGGER.error("Failed to refresh cookie during scheduled refresh: %s", e)
     
-    # Use standard Home Assistant approach: refresh cookies at XX:00 and XX:30
+    # Set up scheduled cookie keepalive and refresh every 10 minutes
     async def refresh_cookies_scheduled():
-        """Refresh cookies at scheduled times (XX:00 and XX:30)."""
+        """Refresh cookies / keepalive session at scheduled intervals (every 10 minutes)."""
         while True:
             now = datetime.now()
             
-            if now.minute < 30:
-                next_refresh = now.replace(minute=30, second=0, microsecond=0)
-            else:
-                # Next refresh at XX:00 (next hour)
+            next_minute = ((now.minute // 10) + 1) * 10
+            if next_minute >= 60:
                 next_refresh = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            else:
+                next_refresh = now.replace(minute=next_minute, second=0, microsecond=0)
             
-            wait_seconds = (next_refresh - now).total_seconds()
-            _LOGGER.debug("Next scheduled cookie refresh at %s (in %.0f seconds)", 
+            wait_seconds = max(1.0, (next_refresh - now).total_seconds())
+            _LOGGER.debug("Next scheduled cookie keepalive/refresh at %s (in %.0f seconds)", 
                          next_refresh.strftime("%H:%M"), wait_seconds)
             
             await asyncio.sleep(wait_seconds)
@@ -589,7 +589,7 @@ class PSEGCoordinator(DataUpdateCoordinator):
                 
         except InvalidAuth as e:
             _LOGGER.error("Authentication failed during coordinator update: %s", e)
-            _LOGGER.debug("Cookie refresh will be attempted at the next scheduled time (XX:00 or XX:30)")
+            _LOGGER.debug("Cookie refresh will be attempted at the next scheduled time (every 10 minutes)")
             
             # Create a persistent notification to alert the user
             await self.hass.async_create_task(
@@ -598,7 +598,7 @@ class PSEGCoordinator(DataUpdateCoordinator):
                     "create",
                     {
                         "title": "PSEG Integration: Authentication Failed",
-                        "message": f"Your PSEG cookie has expired. Cookie refresh will be attempted at the next scheduled time (XX:00 or XX:30).\n\nError: {e}",
+                        "message": f"Your PSEG cookie has expired. Cookie refresh will be attempted at the next scheduled interval (every 10 minutes).\n\nError: {e}",
                         "notification_id": "psegli_auth_failed",
                     },
                 )
@@ -635,6 +635,22 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
             if not valid_points or not isinstance(valid_points, list):
                 _LOGGER.warning("Valid points is not a list: %s", type(valid_points))
                 continue
+
+            # Recorder statistics require hourly timestamps. PSEG can return
+            # 15-minute kWh readings, so combine readings within each hour.
+            hourly_points: dict[datetime, float] = {}
+            for point in valid_points:
+                timestamp = point.get("timestamp")
+                value = point.get("value", 0)
+                if not isinstance(timestamp, datetime):
+                    continue
+                hour = timestamp.replace(minute=0, second=0, microsecond=0)
+                hourly_points[hour] = hourly_points.get(hour, 0.0) + max(0.0, float(value or 0))
+            valid_points = [
+                {"timestamp": timestamp, "value": value}
+                for timestamp, value in sorted(hourly_points.items())
+            ]
+            _LOGGER.debug("Aggregated %d source points into %d hourly points for %s", len(series_data.get("valid_points", [])), len(valid_points), series_name)
             
             # Determine which statistic this series maps to
             if "Off-Peak" in series_name:
@@ -759,7 +775,9 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
                     "statistic_id": statistic_id,  # Use proper format
                     "source": "psegli",  # Use domain as source
                     "unit_of_measurement": "kWh",
+                    "unit_class": "energy",
                     "has_mean": False,
+                    "mean_type": None,
                     "has_sum": True,  # Set to True since we're sending cumulative totals
                     "name": f"PSEG {series_name}",
                 }

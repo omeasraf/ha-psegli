@@ -151,8 +151,13 @@ class PSEGLIClient:
                 for result in chart_setup_json["AjaxResults"]:
                     if result.get("Action") == "Redirect":
                         _LOGGER.error("Chart setup request FAILED - redirected to: %s", result.get('Value'))
-                        _LOGGER.error("This means the hourly context was not set - cannot proceed to get hourly data")
-                        raise InvalidAuth("Chart setup request failed - hourly context not established")
+                        _LOGGER.error(
+                            "Chart setup response: status=%s content_type=%s body=%s",
+                            chart_setup_response.status_code,
+                            chart_setup_response.headers.get("Content-Type", "unknown"),
+                            chart_setup_response.text[:500],
+                        )
+                        _LOGGER.warning("Continuing to ChartData; PSEG may already have the requested chart context")
         except json.JSONDecodeError:
             _LOGGER.error("Chart setup response is not JSON - request failed")
             raise InvalidAuth("Chart setup response is not JSON - request failed")
@@ -275,6 +280,11 @@ class PSEGLIClient:
         for series in chart_series:
                 series_name = series.get("name", "Unknown")
                 data_points = series.get("data", [])
+
+                value_suffix = series.get("tooltip", {}).get("valueSuffix", "")
+                if value_suffix and value_suffix.strip().lower() != "kwh":
+                    _LOGGER.debug("Skipping %s because unit is %s, not kWh", series_name, value_suffix)
+                    continue
                 
                 _LOGGER.debug("Processing series: %s with %d data points", series_name, len(data_points))
                 

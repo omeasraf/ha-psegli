@@ -6,10 +6,20 @@ Uses realistic browsing pattern to avoid detection and obtain authentication coo
 
 import asyncio
 import logging
+import os
 import random
 import time
 from typing import Optional, Dict, Any, List
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+
+try:
+    from playwright_stealth import Stealth
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
+
+DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__)))
+STORAGE_STATE_PATH = os.path.join(DATA_DIR, "storage_state.json")
 
 # Configure logging
 logging.basicConfig(
@@ -35,6 +45,8 @@ class PSEGAutoLogin:
         self.mfa_code = mfa_code
         self.mfa_method = mfa_method.lower() if mfa_method else "sms"
         self.headless = headless
+        self.storage_state_path = STORAGE_STATE_PATH
+        self.last_error = None
         self.playwright = None
         self.browser = None
         self.context = None
@@ -58,115 +70,50 @@ class PSEGAutoLogin:
             _LOGGER.info("🚀 Initializing Playwright browser...")
             self.playwright = await async_playwright().start()
             
-            # Launch browser with stealth options
+            # Launch browser with clean anti-detection options
+            launch_args = [
+                '--no-sandbox',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--disable-infobars',
+            ]
             self.browser = await self.playwright.chromium.launch(
                 headless=self.headless,
-                args=[
-                    '--no-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--disable-features=TranslateUI',
-                    '--disable-ipc-flooding-protection'
-                ]
+                args=launch_args,
+                ignore_default_args=['--enable-automation'],
             )
             
-            # Create context with stealth options
-            self.context = await self.browser.new_context(
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-                extra_http_headers={
-                    'sec-ch-ua': '"Chromium";v="139", "Not;A=Brand";v="99"',
-                    'sec-ch-ua-mobile': '?0',
-                    'sec-ch-ua-platform': '"macOS"'
-                },
-                locale='en-US',
-                timezone_id='America/New_York',
-                permissions=['geolocation'],
-                screen={
+            # Context options with stealth settings
+            context_kwargs = {
+                'viewport': {'width': 1920, 'height': 1080},
+                'locale': 'en-US',
+                'timezone_id': 'America/New_York',
+                'permissions': ['geolocation'],
+                'screen': {
                     'width': 1920,
                     'height': 1080
                 }
-            )
+            }
+            if os.path.exists(self.storage_state_path) and os.path.getsize(self.storage_state_path) > 0:
+                try:
+                    _LOGGER.info(f"📂 Loading saved browser storage state from {self.storage_state_path}")
+                    context_kwargs['storage_state'] = self.storage_state_path
+                except Exception as sse:
+                    _LOGGER.warning(f"Could not use storage state file: {sse}")
+
+            # Create context
+            self.context = await self.browser.new_context(**context_kwargs)
             
-            # Create page and apply stealth
+            # Apply playwright-stealth if available
+            if HAS_STEALTH:
+                try:
+                    await Stealth().apply_stealth_async(self.context)
+                    _LOGGER.info("✅ Applied playwright-stealth to browser context")
+                except Exception as ste:
+                    _LOGGER.warning(f"Could not apply playwright-stealth: {ste}")
+            
+            # Create page
             self.page = await self.context.new_page()
-            
-            # Apply stealth techniques
-            await self.page.add_init_script("""
-                // Override navigator.webdriver
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                    configurable: true
-                });
-                
-                // Ensure window.chrome exists
-                if (!window.chrome) {
-                    Object.defineProperty(window, 'chrome', {
-                        get: () => ({
-                            runtime: {},
-                            loadTimes: function() {},
-                            csi: function() {},
-                            app: {}
-                        }),
-                        configurable: true
-                    });
-                }
-                
-                // Override navigator.permissions
-                if (!navigator.permissions) {
-                    Object.defineProperty(navigator, 'permissions', {
-                        get: () => ({
-                            query: function() { return Promise.resolve({ state: 'granted' }); }
-                        }),
-                        configurable: true
-                    });
-                }
-                
-                // Override navigator.plugins
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => {
-                        const pluginArray = [];
-                        const pluginNames = ['Chrome PDF Plugin', 'Chrome PDF Viewer', 'Native Client'];
-                        const pluginDescriptions = ['Portable Document Format', 'Portable Document Format', 'Native Client Executable'];
-                        const pluginFilenames = ['internal-pdf-viewer', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', 'internal-nacl-plugin'];
-                        
-                        for (let i = 0; i < pluginNames.length; i++) {
-                            const plugin = {
-                                name: pluginNames[i],
-                                description: pluginDescriptions[i],
-                                filename: pluginFilenames[i]
-                            };
-                            pluginArray[i] = plugin;
-                        }
-                        
-                        Object.defineProperty(pluginArray, 'length', { value: pluginNames.length });
-                        return pluginArray;
-                    },
-                    configurable: true
-                });
-                
-                // Override window dimensions
-                Object.defineProperty(window, 'outerWidth', {
-                    get: () => 1922,
-                    configurable: true
-                });
-                Object.defineProperty(window, 'outerHeight', {
-                    get: () => 1055,
-                    configurable: true
-                });
-                
-                // Override deviceMemory
-                Object.defineProperty(navigator, 'deviceMemory', {
-                    get: () => 8,
-                    configurable: true
-                });
-                
-                console.log('🔍 Stealth techniques applied');
-            """)
             
             # Set up request interception
             await self.setup_request_interception()
@@ -259,119 +206,19 @@ class PSEGAutoLogin:
             
             _LOGGER.info("✅ Brave search loaded")
             
-            # Step 2: Open Smart Energy directly so accounts limited to that site
-            # do not depend on the public PSEG homepage or its login button.
+            # Step 2: Open Smart Energy directly
             _LOGGER.info("🏠 Step 2: Navigating directly to PSEG Smart Energy...")
             await self.page.goto(self.mysmartenergy_dashboard_url, wait_until='domcontentloaded')
-
-            # The direct dashboard may redirect to the identity provider.
             try:
-                await self.page.wait_for_url(lambda url: "id.myaccount.psegliny.com" in url, timeout=15000)
-                await self.page.wait_for_load_state('networkidle')
-                _LOGGER.info("✅ Login page loaded")
-            except Exception as e:
-                _LOGGER.warning(f"⚠️ Identity-provider redirect wait failed: {e}")
-                current_url = self.page.url
-                if "id.myaccount.psegliny.com" in current_url:
-                    _LOGGER.info(f"✅ Already on login page: {current_url}")
-                elif "mysmartenergy.psegliny.com" in current_url:
-                    _LOGGER.info(f"✅ Smart Energy dashboard loaded: {current_url}")
-                else:
-                    _LOGGER.error(f"❌ Not on expected Smart Energy or login page: {current_url}")
-                    return False
-            
-            # Step 4: Fill login form
-            _LOGGER.info("📝 Step 4: Filling login form...")
-            
-            # Wait for form fields
-            await self.page.wait_for_selector(
-                'input[name="LoginEmail"], input[name="username"], input[type="email"], input[type="text"]',
-                timeout=10000,
-            )
-            await self.page.wait_for_selector('input[name="password"], input[type="password"]', timeout=10000)
-            
-            # Find username field
-            username_field = await self.page.query_selector(
-                'input[name="LoginEmail"], input[name="username"], input[type="email"], input[type="text"]'
-            )
-            if username_field:
-                await username_field.click()
-                await username_field.fill(self.email)
-                _LOGGER.info("✅ Username entered")
-            else:
-                _LOGGER.error("❌ Username field not found")
-                return False
-            
-            # Find password field
-            password_field = await self.page.query_selector('input[name="password"], input[type="password"]')
-            if password_field:
-                await password_field.click()
-                await password_field.fill(self.password)
-                _LOGGER.info("✅ Password entered")
-            else:
-                _LOGGER.error("❌ Password field not found")
-                return False
-            
-            # Find and click LOG IN button
-            _LOGGER.info("🔘 Looking for LOG IN button...")
-            login_submit_button = await self.page.wait_for_selector(
-                'button.loginBtn, button[type="submit"]:has-text("LOG IN"), '
-                'button[type="submit"]:has-text("Login"), button:has-text("LOG IN"), '
-                'button:has-text("Login")',
-                timeout=10000,
-            )
-            
-            if not login_submit_button:
-                _LOGGER.error("❌ LOG IN button not found")
-                return False
-            
-            _LOGGER.info("✅ LOG IN button found, clicking...")
-            
-            # Click the login button
-            await login_submit_button.click()
-            
-            # Wait for page to settle (either dashboard redirect or MFA challenge)
-            _LOGGER.info("🔄 Waiting for dashboard or MFA challenge...")
-            await asyncio.sleep(3.0)
-            
+                await self.page.wait_for_load_state('networkidle', timeout=10000)
+            except Exception:
+                pass
+
             current_url = self.page.url
             page_content = await self.page.content()
             page_content_lower = page_content.lower()
-            try:
-                visible_text_lower = (await self.page.locator("body").inner_text()).lower()
-            except Exception:
-                visible_text_lower = page_content_lower
 
-            login_form_present = await self.page.query_selector(
-                'form.loginForm, #LoginEmail, #LoginPassword'
-            ) is not None
-            captcha_indicators = [
-                "captcha", "recaptcha", "verify you are human", "i'm not a robot",
-                "im not a robot", "robot check",
-            ]
-            visible_captcha_frame = False
-            for captcha_frame in await self.page.locator('iframe[src*="recaptcha"]').all():
-                if await captcha_frame.is_visible():
-                    visible_captcha_frame = True
-                    break
-            visible_captcha_text = any(indicator in visible_text_lower for indicator in captcha_indicators)
-            if login_form_present and (visible_captcha_frame or visible_captcha_text):
-                _LOGGER.error("❌ CAPTCHA challenge detected on the Smart Energy login form")
-                try:
-                    with open("captcha_page_debug.html", "w", encoding="utf-8") as debug_file:
-                        debug_file.write(page_content)
-                except Exception:
-                    pass
-                return False
-
-            mfa_indicators = [
-                "verification code", "enter the code", "one-time code",
-                "multi-factor", "multi factor", "mfa", "2fa", "two-factor",
-                "verify your identity", "security code", "we sent a code",
-                "sent to your", "check your email", "6-digit code",
-                "send me an email",
-            ]
-            is_mfa_page = any(indicator in visible_text_lower for indicator in mfa_indicators)
+            # Check if we are already authenticated on Smart Energy dashboard (e.g. from saved storage_state)
             is_smart_energy_dashboard = (
                 "mysmartenergy.psegliny.com" in current_url
                 and "/dashboard" in current_url.lower()
@@ -380,11 +227,145 @@ class PSEGAutoLogin:
                     or 'id="propertyselect"' in page_content_lower
                     or 'id="ajaxcontent"' in page_content_lower
                 )
-                and "loginemail" not in visible_text_lower
+                and "loginemail" not in page_content_lower
             )
+
             if is_smart_energy_dashboard:
-                _LOGGER.info("✅ Smart Energy dashboard markers detected")
-            
+                _LOGGER.info("✅ Already authenticated on Smart Energy dashboard (session active)")
+            else:
+                # Step 4: Fill login form on Smart Energy
+                _LOGGER.info("📝 Step 4: Filling Smart Energy login form...")
+
+                # Wait for email and password fields
+                email_field = await self.page.wait_for_selector(
+                    'input[name="LoginEmail"], #LoginEmail, input[type="email"], input[type="text"]',
+                    timeout=10000,
+                )
+                password_field = await self.page.wait_for_selector(
+                    'input[name="LoginPassword"], #LoginPassword, input[name="password"], input[type="password"]',
+                    timeout=10000,
+                )
+
+                if not email_field or not password_field:
+                    _LOGGER.error("❌ Login form fields not found on Smart Energy page")
+                    self.last_error = "Login form fields not found on Smart Energy page"
+                    return False
+
+                # Type credentials with human-like delays
+                await email_field.click()
+                await asyncio.sleep(random.uniform(0.3, 0.6))
+                for char in self.email:
+                    await self.page.keyboard.type(char)
+                    await asyncio.sleep(random.uniform(0.04, 0.12))
+                _LOGGER.info("✅ Username/Email entered")
+                await asyncio.sleep(random.uniform(0.5, 0.9))
+
+                await password_field.click()
+                await asyncio.sleep(random.uniform(0.3, 0.6))
+                for char in self.password:
+                    await self.page.keyboard.type(char)
+                    await asyncio.sleep(random.uniform(0.04, 0.12))
+                _LOGGER.info("✅ Password entered")
+                await asyncio.sleep(random.uniform(0.5, 1.0))
+
+                # Check "Remember Me" toggle so ASP.NET sets a persistent cookie
+                remember_me = await self.page.query_selector('#RememberMe, input[name="RememberMe"]')
+                if remember_me:
+                    try:
+                        if not await remember_me.is_checked():
+                            await remember_me.click()
+                            _LOGGER.info("✅ Checked 'Remember Me'")
+                    except Exception:
+                        pass
+                await asyncio.sleep(random.uniform(0.5, 1.0))
+
+                # Find and click LOG IN button
+                login_submit_button = await self.page.wait_for_selector(
+                    'button.loginBtn, button[type="submit"]:has-text("LOG IN"), button:has-text("Login")',
+                    timeout=10000,
+                )
+                if not login_submit_button:
+                    _LOGGER.error("❌ LOG IN button not found")
+                    self.last_error = "LOG IN button not found"
+                    return False
+
+                _LOGGER.info("✅ Moving cursor and clicking LOG IN button...")
+                box = await login_submit_button.bounding_box()
+                if box:
+                    target_x = box['x'] + box['width'] * random.uniform(0.3, 0.7)
+                    target_y = box['y'] + box['height'] * random.uniform(0.3, 0.7)
+                    await self.page.mouse.move(target_x, target_y, steps=random.randint(15, 25))
+                    await asyncio.sleep(random.uniform(0.2, 0.4))
+                await login_submit_button.click()
+
+                # Poll for login outcome (allow up to 120s in headed mode for user to solve challenge)
+                max_polls = 120 if not self.headless else 35
+                _LOGGER.info(f"🔄 Waiting up to {max_polls}s for login response / dashboard...")
+                login_success = False
+                for poll_i in range(max_polls):
+                    await asyncio.sleep(1.0)
+                    current_url = self.page.url
+                    page_content = await self.page.content()
+                    page_content_lower = page_content.lower()
+
+                    # 1. Success check: Dashboard loaded and login form is gone
+                    has_dashboard_marker = (
+                        "__requestverificationtoken" in page_content_lower
+                        or 'id="propertyselect"' in page_content_lower
+                        or 'id="ajaxcontent"' in page_content_lower
+                    )
+                    if has_dashboard_marker and "loginemail" not in page_content_lower:
+                        _LOGGER.info(f"🎉 Smart Energy dashboard loaded successfully after {poll_i + 1}s!")
+                        login_success = True
+                        is_smart_energy_dashboard = True
+                        break
+
+                    # 2. Check for real on-screen interactive reCAPTCHA puzzle (not the badge!)
+                    challenge_visible = False
+                    try:
+                        for cf in await self.page.locator('iframe[title*="recaptcha challenge"], iframe[src*="bframe"]').all():
+                            box = await cf.bounding_box()
+                            if box and box['width'] > 200 and box['height'] > 200 and box['y'] >= 0:
+                                challenge_visible = True
+                                break
+                    except Exception:
+                        pass
+
+                    if challenge_visible:
+                        if not self.headless:
+                            if poll_i % 10 == 0:
+                                _LOGGER.info(f"🧩 Interactive reCAPTCHA puzzle active on screen. Please solve it in the browser! ({poll_i}s elapsed)")
+                            # Do NOT abort! Continue polling so user can solve the challenge
+                            continue
+                        else:
+                            _LOGGER.error("❌ Interactive Google reCAPTCHA puzzle appeared in headless mode")
+                            self.last_error = (
+                                "Interactive reCAPTCHA puzzle appeared. Please run once in headed mode "
+                                "(e.g. 'HEADED=1 python run.py' or 'python auto_login.py --headed --email ... --password ...') "
+                                "to solve it once in a browser window and save the session."
+                            )
+                            try:
+                                with open("captcha_page_debug.html", "w", encoding="utf-8") as debug_file:
+                                    debug_file.write(page_content)
+                                await self.page.screenshot(path="captcha_challenge.png")
+                            except Exception:
+                                pass
+                            return False
+
+                    # 3. Check for login validation error from server (e.g. wrong password)
+                    error_elem = await self.page.query_selector('.field-validation-error:not(:empty), .validation-summary-errors:not(:empty)')
+                    if error_elem:
+                        err_text = (await error_elem.inner_text() or "").strip()
+                        if err_text:
+                            _LOGGER.error(f"❌ Login validation error from Smart Energy: {err_text}")
+                            self.last_error = err_text
+                            return False
+
+                if not login_success:
+                    _LOGGER.error("❌ Login timed out waiting for Smart Energy dashboard")
+                    self.last_error = "Login timed out waiting for Smart Energy dashboard"
+                    return False
+            is_mfa_page = False
             if is_mfa_page and not is_smart_energy_dashboard:
                     _LOGGER.info("🔐 MFA/verification challenge detected")
                     
@@ -506,17 +487,14 @@ class PSEGAutoLogin:
                         # MFA required but no code provided - signal caller to use two-phase flow
                         return "MFA_REQUIRED"
             
-            # Wait for the legacy dashboard only when direct Smart Energy did not load.
-            if is_smart_energy_dashboard:
-                _LOGGER.info("✅ Smart Energy dashboard loaded")
-            else:
+            if not is_smart_energy_dashboard:
                 _LOGGER.info("🔄 Waiting for dashboard to load...")
                 try:
                     await self.page.wait_for_url(lambda url: "myaccount.psegliny.com/dashboards" in url, timeout=25000)
                     await self.page.wait_for_load_state('networkidle')
                     _LOGGER.info("✅ Dashboard loaded")
                 except Exception as e:
-                # Check if we're still on the login/OAuth page (login failed)
+                    # Check if we're still on the login/OAuth page (login failed)
                     current_url = self.page.url
                     if "id.myaccount.psegliny.com/oauth2" in current_url:
                         page_content = await self.page.content()
@@ -535,102 +513,92 @@ class PSEGAutoLogin:
                             _LOGGER.debug("Could not save login diagnostics: %s", debug_error)
                     return False
             
-            # Step 5: Wait for exceptional dashboard to load and manually make redirect request
-            _LOGGER.info("⚡ Step 5: Waiting for exceptional dashboard and manually making redirect request...")
-            
-            # Wait for the exceptional dashboard POST request to complete
-            await asyncio.sleep(3.0)  # Give time for the POST request to complete
-            
-            # Scroll to simulate browsing and wait for content to load
-            await self.page.mouse.wheel(0, random.randint(600, 800))
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-            
-            # Add additional wait to ensure page is fully loaded
-            try:
-                await self.page.wait_for_load_state('domcontentloaded', timeout=10000)
-            except Exception as e:
-                _LOGGER.warning(f"⚠️ DOM content load wait failed: {e}")
-            
-            # Check if we captured the exceptional dashboard data
-            if not self.exceptional_dashboard_data:
-                _LOGGER.warning("⚠️ Exceptional dashboard data not captured, trying direct navigation...")
-                await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded')
-            else:
-                _LOGGER.info("✅ Exceptional dashboard data captured, manually making redirect request...")
+                # Step 5: Wait for exceptional dashboard to load and manually make redirect request
+                _LOGGER.info("⚡ Step 5: Waiting for exceptional dashboard and manually making redirect request...")
                 
-                # Manually make the redirect request with the captured headers
+                # Wait for the exceptional dashboard POST request to complete
+                await asyncio.sleep(3.0)  # Give time for the POST request to complete
+                
+                # Scroll to simulate browsing and wait for content to load
+                await self.page.mouse.wheel(0, random.randint(600, 800))
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                
+                # Add additional wait to ensure page is fully loaded
                 try:
-                    # Extract the important headers from the exceptional dashboard request
-                    headers = self.exceptional_dashboard_data['headers']
-                    important_headers = {
-                        'accept': headers.get('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'),
-                        'accept-language': headers.get('accept-language', 'en-US,en;q=0.5'),
-                        'referer': headers.get('referer', self.exceptional_dashboard),
-                        'sec-fetch-dest': 'document',
-                        'sec-fetch-mode': 'navigate',
-                        'sec-fetch-site': 'same-origin',
-                        'upgrade-insecure-requests': '1'
-                    }
+                    await self.page.wait_for_load_state('domcontentloaded', timeout=10000)
+                except Exception as e:
+                    _LOGGER.warning(f"⚠️ DOM content load wait failed: {e}")
+                
+                # Check if we captured the exceptional dashboard data
+                if not self.exceptional_dashboard_data:
+                    _LOGGER.warning("⚠️ Exceptional dashboard data not captured, trying direct navigation...")
+                    await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded')
+                else:
+                    _LOGGER.info("✅ Exceptional dashboard data captured, manually making redirect request...")
                     
-                    # Get cookies from context for the request
-                    context_cookies = await self.context.cookies()
-                    cookie_string = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in context_cookies if cookie['domain'] in ['.psegliny.com', '.myaccount.psegliny.com']])
-                    
-                    if cookie_string:
-                        important_headers['cookie'] = cookie_string
-                    
-                    _LOGGER.info(f"🔍 Making manual redirect request to {self.mysmartenergy_redirect}")
-                    
-                    # Make the redirect request manually
-                    response = await self.page.request.get(self.mysmartenergy_redirect, headers=important_headers)
-                    
-                    if response.status == 302:
-                        _LOGGER.info("✅ Redirect response received (302)")
-                        # Follow the redirect by getting the final URL
-                        final_url = response.headers.get('location')
-                        if final_url:
-                            _LOGGER.info(f"🔄 Following redirect to: {final_url}")
-                            try:
-                                await self.page.goto(final_url, wait_until='domcontentloaded', timeout=20000)
-                            except Exception as nav_error:
-                                _LOGGER.warning(f"⚠️ Redirect navigation failed: {nav_error}, trying direct navigation...")
+                    # Manually make the redirect request with the captured headers
+                    try:
+                        headers = self.exceptional_dashboard_data['headers']
+                        important_headers = {
+                            'accept': headers.get('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'),
+                            'accept-language': headers.get('accept-language', 'en-US,en;q=0.5'),
+                            'referer': headers.get('referer', self.exceptional_dashboard),
+                            'sec-fetch-dest': 'document',
+                            'sec-fetch-mode': 'navigate',
+                            'sec-fetch-site': 'same-origin',
+                            'upgrade-insecure-requests': '1'
+                        }
+                        
+                        # Get cookies from context for the request
+                        context_cookies = await self.context.cookies()
+                        cookie_string = '; '.join([f"{cookie['name']}={cookie['value']}" for cookie in context_cookies if cookie['domain'] in ['.psegliny.com', '.myaccount.psegliny.com']])
+                        
+                        if cookie_string:
+                            important_headers['cookie'] = cookie_string
+                        
+                        _LOGGER.info(f"🔍 Making manual redirect request to {self.mysmartenergy_redirect}")
+                        
+                        # Make the redirect request manually
+                        response = await self.page.request.get(self.mysmartenergy_redirect, headers=important_headers)
+                        
+                        if response.status == 302:
+                            _LOGGER.info("✅ Redirect response received (302)")
+                            final_url = response.headers.get('location')
+                            if final_url:
+                                _LOGGER.info(f"🔄 Following redirect to: {final_url}")
+                                try:
+                                    await self.page.goto(final_url, wait_until='domcontentloaded', timeout=20000)
+                                except Exception as nav_error:
+                                    _LOGGER.warning(f"⚠️ Redirect navigation failed: {nav_error}, trying direct navigation...")
+                                    await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded', timeout=20000)
+                            else:
+                                _LOGGER.warning("⚠️ No location header in redirect, trying direct navigation...")
                                 await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded', timeout=20000)
                         else:
-                            _LOGGER.warning("⚠️ No location header in redirect, trying direct navigation...")
+                            _LOGGER.warning(f"⚠️ Unexpected response status: {response.status}, trying direct navigation...")
                             await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded', timeout=20000)
-                    else:
-                        _LOGGER.warning(f"⚠️ Unexpected response status: {response.status}, trying direct navigation...")
+                            
+                    except Exception as e:
+                        _LOGGER.warning(f"⚠️ Manual redirect failed: {e}, falling back to direct navigation...")
                         await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded', timeout=20000)
-                        
-                except Exception as e:
-                    _LOGGER.warning(f"⚠️ Manual redirect failed: {e}, falling back to direct navigation...")
-                    await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded', timeout=20000)
-            
-            # Wait for MySmartEnergy dashboard - use more robust navigation approach
-            try:
-                # First try to wait for the URL change
-                await self.page.wait_for_url(lambda url: "mysmartenergy.psegliny.com/Dashboard" in url, timeout=20000)
-            except Exception as e:
-                _LOGGER.warning(f"⚠️ URL wait failed: {e}, trying alternative approach...")
-                # Fallback: wait for any navigation to complete and check current URL
-                await self.page.wait_for_load_state('networkidle', timeout=20000)
                 
-                # Check if we're on the right page
-                current_url = self.page.url
-                if "mysmartenergy.psegliny.com/Dashboard" not in current_url:
-                    _LOGGER.warning(f"⚠️ Not on expected dashboard, current URL: {current_url}")
-                    # Try to navigate directly if we're not on the right page
-                    await self.page.goto(self.final_dashboard, wait_until='domcontentloaded', timeout=20000)
-            
-            await self.page.wait_for_load_state('networkidle', timeout=10000)
-            
-            _LOGGER.info("✅ MySmartEnergy Dashboard loaded")
+                # Wait for MySmartEnergy dashboard
+                try:
+                    await self.page.wait_for_url(lambda url: "mysmartenergy.psegliny.com/Dashboard" in url, timeout=20000)
+                except Exception as e:
+                    _LOGGER.warning(f"⚠️ URL wait failed: {e}, trying alternative approach...")
+                    await self.page.wait_for_load_state('networkidle', timeout=20000)
+                    current_url = self.page.url
+                    if "mysmartenergy.psegliny.com/Dashboard" not in current_url:
+                        _LOGGER.warning(f"⚠️ Not on expected dashboard, current URL: {current_url}")
+                        await self.page.goto(self.final_dashboard, wait_until='domcontentloaded', timeout=20000)
+                
+                await self.page.wait_for_load_state('networkidle', timeout=10000)
+                _LOGGER.info("✅ MySmartEnergy Dashboard loaded")
             
             # Step 6: Get cookies from the final dashboard
             _LOGGER.info("🍪 Step 6: Capturing cookies from final dashboard...")
-            
-            # Wait a moment for any additional requests to complete
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(2.0)
             
             # Get cookies from browser context
             context_cookies = await self.context.cookies()
@@ -638,6 +606,14 @@ class PSEGAutoLogin:
                 if cookie['domain'] in ['.psegliny.com', '.myaccount.psegliny.com', '.mysmartenergy.psegliny.com']:
                     self.login_cookies[cookie['name']] = cookie['value']
                     _LOGGER.info(f"🍪 Context cookie: {cookie['name']} = {cookie['value'][:50]}...")
+            
+            # Save storage state to preserve session across restarts
+            try:
+                os.makedirs(os.path.dirname(self.storage_state_path), exist_ok=True)
+                await self.context.storage_state(path=self.storage_state_path)
+                _LOGGER.info(f"💾 Saved browser storage state to {self.storage_state_path}")
+            except Exception as se:
+                _LOGGER.debug(f"Could not save storage state: {se}")
             
             _LOGGER.info("✅ Realistic browsing pattern completed successfully")
             return True

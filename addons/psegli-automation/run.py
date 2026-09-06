@@ -182,7 +182,8 @@ async def login(request: LoginRequest):
             return LoginResponse(success=True, cookies=result)
         else:
             logger.warning("Login failed, no cookies returned")
-            return LoginResponse(success=False, error="Login failed")
+            error_msg = getattr(cookie_getter, "last_error", None) or "Login failed"
+            return LoginResponse(success=False, error=error_msg)
             
     except Exception as e:
         logger.error(f"Login error: {e}")
