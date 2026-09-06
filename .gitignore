@@ -110,3 +110,6 @@ celerybeat.pid
 .mypy_cache/
 .dmypy.json
 dmypy.json 
+addons/psegli-automation/storage_state.json
+addons/psegli-automation/captcha_page_debug.html
+addons/psegli-automation/captcha_challenge.png

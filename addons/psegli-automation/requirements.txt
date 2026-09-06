@@ -6,3 +6,4 @@ playwright==1.62.0
 playwright-stealth==2.0.3
 aiohttp==3.14.3
 requests==2.34.2
+SpeechRecognition==3.14.1

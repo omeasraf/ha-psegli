@@ -8,6 +8,7 @@ from typing import Any
 
 import pytz
 
+from homeassistant.components.recorder.models import StatisticMeanType
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
@@ -777,7 +778,7 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
                     "unit_of_measurement": "kWh",
                     "unit_class": "energy",
                     "has_mean": False,
-                    "mean_type": None,
+                    "mean_type": StatisticMeanType.NONE,
                     "has_sum": True,  # Set to True since we're sending cumulative totals
                     "name": f"PSEG {series_name}",
                 }
@@ -894,4 +895,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "refresh_cookie")
     hass.services.async_remove(DOMAIN, "enter_mfa_code")
     
-    return True 
+    return True

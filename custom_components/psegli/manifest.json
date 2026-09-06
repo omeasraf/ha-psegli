@@ -1,14 +1,14 @@
 {
   "domain": "psegli",
   "name": "PSEG Long Island",
-  "documentation": "https://github.com/daswass/ha-psegli",
+  "documentation": "https://github.com/omeasraf/ha-psegli",
   "dependencies": [],
   "codeowners": ["@daswass"],
   "requirements": ["requests==2.34.2", "beautifulsoup4==4.15.0"],
   "ssdp": [],
   "zeroconf": [],
   "homekit": {},
-  "version": "2.4.7",
+  "version": "2.4.8",
   "config_flow": true,
   "iot_class": "cloud_polling"
 }
