@@ -122,7 +122,9 @@ class PSEGLIClient:
             "__RequestVerificationToken": request_token,
             "UsageInterval": "5",  # 5 = Hourly granularity
             "UsageType": "1",
-            "jsTargetName": "StorageType",
+            # Smart Energy uses this field to determine which chart setting
+            # changed. Target UsageType so value 1 switches Demand to kWh.
+            "jsTargetName": "UsageType",
             "EnableHoverChart": "true",
             "Start": start_date.strftime("%Y-%m-%d"),
             "End": end_date.strftime("%Y-%m-%d"),
@@ -261,9 +263,16 @@ class PSEGLIClient:
                             "comparison": comparison,
                         }
 
-        # Parse chart data
-        if "Data" in chart_data and "series" in chart_data["Data"]:
-            for series in chart_data["Data"]["series"]:
+        # Smart Energy has returned both {"Data": {"series": [...]}} and
+        # {"series": [...]} response shapes over time.
+        chart_series = chart_data.get("series", [])
+        if not chart_series and isinstance(chart_data.get("Data"), dict):
+            chart_series = chart_data["Data"].get("series", [])
+
+        if not chart_series:
+            _LOGGER.warning("Chart response contained no series; keys=%s", list(chart_data))
+
+        for series in chart_series:
                 series_name = series.get("name", "Unknown")
                 data_points = series.get("data", [])
                 
