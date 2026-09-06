@@ -4,10 +4,13 @@
 import asyncio
 import logging
 import os
+import re
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 # Set HEADED=1 to run browser in headed mode (visible) for local MFA debugging
 HEADED = os.environ.get("HEADED", "").lower() in ("1", "true", "yes")
+import aiohttp
 from fastapi import FastAPI, HTTPException, Form
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -37,6 +40,10 @@ class LoginRequest(BaseModel):
 class MfaRequest(BaseModel):
     code: str
 
+class StatisticsTestRequest(BaseModel):
+    cookie: str
+    days_back: int = 1
+
 class LoginResponse(BaseModel):
     success: bool
     cookies: Optional[str] = None
@@ -47,6 +54,94 @@ class LoginResponse(BaseModel):
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "service": "psegli-automation"}
+
+@app.post("/test-statistics")
+async def test_statistics(request: StatisticsTestRequest):
+    """Test the Smart Energy requests used by the statistics updater."""
+    if not request.cookie.strip():
+        raise HTTPException(status_code=400, detail="cookie is required")
+    if request.days_back < 1 or request.days_back > 365:
+        raise HTTPException(status_code=400, detail="days_back must be between 1 and 365")
+
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=request.days_back)
+    headers = {
+        "Cookie": request.cookie,
+        "Referer": "https://mysmartenergy.psegliny.com/Dashboard",
+        "User-Agent": "Mozilla/5.0",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    result = {
+        "dashboard_status": None,
+        "dashboard_url": None,
+        "token_found": False,
+        "chart_setup_status": None,
+        "chart_setup_redirect": None,
+        "chart_data_status": None,
+        "series": [],
+    }
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        async with session.get("https://mysmartenergy.psegliny.com/Dashboard") as response:
+            dashboard_html = await response.text()
+            result["dashboard_status"] = response.status
+            result["dashboard_url"] = str(response.url)
+
+        token_match = re.search(
+            r"<input[^>]+name=['\"]__RequestVerificationToken['\"][^>]+value=['\"]([^'\"]+)",
+            dashboard_html,
+            flags=re.IGNORECASE,
+        ) or re.search(
+            r"<input[^>]+value=['\"]([^'\"]+)['\"][^>]+name=['\"]__RequestVerificationToken['\"]",
+            dashboard_html,
+            flags=re.IGNORECASE,
+        )
+        result["token_found"] = token_match is not None
+        if not token_match:
+            return result
+
+        chart_request = {
+            "__RequestVerificationToken": token_match.group(1),
+            "UsageInterval": "5",
+            "UsageType": "1",
+            "jsTargetName": "StorageType",
+            "EnableHoverChart": "true",
+            "Start": start_date.strftime("%Y-%m-%d"),
+            "End": end_date.strftime("%Y-%m-%d"),
+            "IsRangeOpen": "False",
+            "MaintainMaxDate": "true",
+            "SelectedViaDateRange": "False",
+            "ChartComparison": "0",
+            "ChartComparison2": "0",
+            "ChartComparison3": "0",
+            "ChartComparison4": "0",
+        }
+        async with session.post("https://mysmartenergy.psegliny.com/Dashboard/Chart", data=chart_request) as response:
+            result["chart_setup_status"] = response.status
+            if response.content_type == "application/json":
+                try:
+                    payload = await response.json()
+                    for item in payload.get("AjaxResults", []):
+                        if item.get("Action") == "Redirect":
+                            result["chart_setup_redirect"] = item.get("Value")
+                except (TypeError, ValueError):
+                    pass
+
+        async with session.get("https://mysmartenergy.psegliny.com/Dashboard/ChartData") as response:
+            result["chart_data_status"] = response.status
+            if response.content_type == "application/json":
+                try:
+                    payload = await response.json()
+                    series = payload.get("Data", payload).get("series", [])
+                    result["series"] = [
+                        {"name": item.get("name"), "points": len(item.get("data", []))}
+                        for item in series
+                    ]
+                except (TypeError, ValueError):
+                    pass
+
+    return result
 
 @app.post("/login", response_model=LoginResponse)
 async def login(request: LoginRequest):

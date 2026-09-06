@@ -77,15 +77,40 @@ class PSEGLIClient:
         dashboard_response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard")
         if dashboard_response.status_code != 200:
             raise InvalidAuth("Failed to get Dashboard page")
+
+        response_url = dashboard_response.url.lower()
+        response_text = dashboard_response.text
+        response_text_lower = response_text.lower()
+        if "login" in response_url or "signin" in response_url or "sign in" in response_text_lower:
+            raise InvalidAuth("Authentication cookie expired or was rejected")
         
         # Extract the token from the page
         import re
-        token_match = re.search(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"', dashboard_response.text)
-        if token_match:
-            request_token = token_match.group(1)
+        token_tag = BeautifulSoup(response_text, "html.parser").find(
+            "input", attrs={"name": "__RequestVerificationToken"}
+        )
+        request_token = token_tag.get("value") if token_tag else None
+        if not request_token:
+            # Keep a tolerant fallback for malformed HTML responses.
+            token_match = re.search(
+                r"__RequestVerificationToken[^>]+value=['\"]([^'\"]+)['\"]",
+                response_text,
+                flags=re.IGNORECASE,
+            )
+            request_token = token_match.group(1) if token_match else None
+
+        if request_token:
             _LOGGER.debug("Found RequestVerificationToken: %s...", request_token[:20])
         else:
-            _LOGGER.error("Could not find RequestVerificationToken on /Dashboard")
+            _LOGGER.error(
+                "Could not find RequestVerificationToken on /Dashboard (url=%s, content_type=%s, length=%d, title=%s)",
+                dashboard_response.url,
+                dashboard_response.headers.get("Content-Type", "unknown"),
+                len(response_text),
+                BeautifulSoup(response_text, "html.parser").title.get_text(strip=True)
+                if BeautifulSoup(response_text, "html.parser").title
+                else "unknown",
+            )
             raise InvalidAuth("Could not find RequestVerificationToken on /Dashboard")
         
         return dashboard_response.text, request_token

@@ -43,8 +43,8 @@ class PSEGAutoLogin:
         self.exceptional_dashboard_data = None
         
         # URLs for the realistic browsing flow
-        self.brave_search_url = "https://search.brave.com/search?q=pseg+long+island&source=desktop"
-        self.pseg_main_url = "https://www.psegliny.com/"
+        self.brave_search_url = "https://search.brave.com/search?q=PSEG+Smart+Energy&source=desktop"
+        self.mysmartenergy_dashboard_url = "https://mysmartenergy.psegliny.com/Dashboard"
         self.login_page_url = "https://myaccount.psegliny.com/user/login"
         self.id_domain = "https://id.myaccount.psegliny.com/"
         self.dashboard_url = "https://myaccount.psegliny.com/dashboards"
@@ -259,48 +259,41 @@ class PSEGAutoLogin:
             
             _LOGGER.info("✅ Brave search loaded")
             
-            # Step 2: Navigate to PSEG main site
-            _LOGGER.info("🏠 Step 2: Navigating to PSEG main site...")
-            await self.page.goto(self.pseg_main_url, wait_until='domcontentloaded')
-            await self.page.wait_for_load_state('networkidle')
-            
-            _LOGGER.info("✅ PSEG main site loaded")
-            
-            # Step 3: Find and click login button
-            _LOGGER.info("🔑 Step 3: Looking for login button...")
-            login_button = await self.page.wait_for_selector('#login', timeout=10000)
-            
-            if not login_button:
-                _LOGGER.error("❌ Login button not found")
-                return False
-            
-            _LOGGER.info("✅ Login button found, clicking...")
-            await login_button.click()
-            
-            # Wait for login page to load
+            # Step 2: Open Smart Energy directly so accounts limited to that site
+            # do not depend on the public PSEG homepage or its login button.
+            _LOGGER.info("🏠 Step 2: Navigating directly to PSEG Smart Energy...")
+            await self.page.goto(self.mysmartenergy_dashboard_url, wait_until='domcontentloaded')
+
+            # The direct dashboard may redirect to the identity provider.
             try:
                 await self.page.wait_for_url(lambda url: "id.myaccount.psegliny.com" in url, timeout=15000)
                 await self.page.wait_for_load_state('networkidle')
                 _LOGGER.info("✅ Login page loaded")
             except Exception as e:
-                _LOGGER.warning(f"⚠️ Login page navigation wait failed: {e}")
-                # Check current URL and continue if we're already on the right page
+                _LOGGER.warning(f"⚠️ Identity-provider redirect wait failed: {e}")
                 current_url = self.page.url
                 if "id.myaccount.psegliny.com" in current_url:
                     _LOGGER.info(f"✅ Already on login page: {current_url}")
+                elif "mysmartenergy.psegliny.com" in current_url:
+                    _LOGGER.info(f"✅ Smart Energy dashboard loaded: {current_url}")
                 else:
-                    _LOGGER.error(f"❌ Not on expected login page: {current_url}")
+                    _LOGGER.error(f"❌ Not on expected Smart Energy or login page: {current_url}")
                     return False
             
             # Step 4: Fill login form
             _LOGGER.info("📝 Step 4: Filling login form...")
             
             # Wait for form fields
-            await self.page.wait_for_selector('input[name="username"], input[type="email"], input[type="text"]', timeout=10000)
+            await self.page.wait_for_selector(
+                'input[name="LoginEmail"], input[name="username"], input[type="email"], input[type="text"]',
+                timeout=10000,
+            )
             await self.page.wait_for_selector('input[name="password"], input[type="password"]', timeout=10000)
             
             # Find username field
-            username_field = await self.page.query_selector('input[name="username"], input[type="email"], input[type="text"]')
+            username_field = await self.page.query_selector(
+                'input[name="LoginEmail"], input[name="username"], input[type="email"], input[type="text"]'
+            )
             if username_field:
                 await username_field.click()
                 await username_field.fill(self.email)
@@ -321,7 +314,12 @@ class PSEGAutoLogin:
             
             # Find and click LOG IN button
             _LOGGER.info("🔘 Looking for LOG IN button...")
-            login_submit_button = await self.page.wait_for_selector('button[type="submit"]:has-text("LOG IN"), button:has-text("LOG IN")', timeout=10000)
+            login_submit_button = await self.page.wait_for_selector(
+                'button.loginBtn, button[type="submit"]:has-text("LOG IN"), '
+                'button[type="submit"]:has-text("Login"), button:has-text("LOG IN"), '
+                'button:has-text("Login")',
+                timeout=10000,
+            )
             
             if not login_submit_button:
                 _LOGGER.error("❌ LOG IN button not found")
@@ -337,19 +335,57 @@ class PSEGAutoLogin:
             await asyncio.sleep(3.0)
             
             current_url = self.page.url
+            page_content = await self.page.content()
+            page_content_lower = page_content.lower()
+            try:
+                visible_text_lower = (await self.page.locator("body").inner_text()).lower()
+            except Exception:
+                visible_text_lower = page_content_lower
+
+            login_form_present = await self.page.query_selector(
+                'form.loginForm, #LoginEmail, #LoginPassword'
+            ) is not None
+            captcha_indicators = [
+                "captcha", "recaptcha", "verify you are human", "i'm not a robot",
+                "im not a robot", "robot check",
+            ]
+            visible_captcha_frame = False
+            for captcha_frame in await self.page.locator('iframe[src*="recaptcha"]').all():
+                if await captcha_frame.is_visible():
+                    visible_captcha_frame = True
+                    break
+            visible_captcha_text = any(indicator in visible_text_lower for indicator in captcha_indicators)
+            if login_form_present and (visible_captcha_frame or visible_captcha_text):
+                _LOGGER.error("❌ CAPTCHA challenge detected on the Smart Energy login form")
+                try:
+                    with open("captcha_page_debug.html", "w", encoding="utf-8") as debug_file:
+                        debug_file.write(page_content)
+                except Exception:
+                    pass
+                return False
+
+            mfa_indicators = [
+                "verification code", "enter the code", "one-time code",
+                "multi-factor", "multi factor", "mfa", "2fa", "two-factor",
+                "verify your identity", "security code", "we sent a code",
+                "sent to your", "check your email", "6-digit code",
+                "send me an email",
+            ]
+            is_mfa_page = any(indicator in visible_text_lower for indicator in mfa_indicators)
+            is_smart_energy_dashboard = (
+                "mysmartenergy.psegliny.com" in current_url
+                and "/dashboard" in current_url.lower()
+                and (
+                    "__requestverificationtoken" in page_content_lower
+                    or 'id="propertyselect"' in page_content_lower
+                    or 'id="ajaxcontent"' in page_content_lower
+                )
+                and "loginemail" not in visible_text_lower
+            )
+            if is_smart_energy_dashboard:
+                _LOGGER.info("✅ Smart Energy dashboard markers detected")
             
-            # Check if we hit an MFA/verification challenge (PSEG added MFA in late 2024/early 2025)
-            if "id.myaccount.psegliny.com" in current_url and "dashboards" not in current_url:
-                page_content = await self.page.content()
-                mfa_indicators = [
-                    "verification code", "enter the code", "one-time",
-                    "multi-factor", "multi factor", "mfa", "2fa", "two-factor",
-                    "authenticate", "verify your identity", "security code",
-                    "we sent a code", "sent to your", "check your email"
-                ]
-                is_mfa_page = any(indicator in page_content.lower() for indicator in mfa_indicators)
-                
-                if is_mfa_page:
+            if is_mfa_page and not is_smart_energy_dashboard:
                     _LOGGER.info("🔐 MFA/verification challenge detected")
                     
                     # Select delivery method (SMS vs Email) if user prefers SMS
@@ -470,26 +506,33 @@ class PSEGAutoLogin:
                         # MFA required but no code provided - signal caller to use two-phase flow
                         return "MFA_REQUIRED"
             
-            # Wait for dashboard to load
-            _LOGGER.info("🔄 Waiting for dashboard to load...")
-            
-            try:
-                # Wait for redirect to dashboard
-                await self.page.wait_for_url(lambda url: "myaccount.psegliny.com/dashboards" in url, timeout=25000)
-                await self.page.wait_for_load_state('networkidle')
-                _LOGGER.info("✅ Dashboard loaded")
-            except Exception as e:
+            # Wait for the legacy dashboard only when direct Smart Energy did not load.
+            if is_smart_energy_dashboard:
+                _LOGGER.info("✅ Smart Energy dashboard loaded")
+            else:
+                _LOGGER.info("🔄 Waiting for dashboard to load...")
+                try:
+                    await self.page.wait_for_url(lambda url: "myaccount.psegliny.com/dashboards" in url, timeout=25000)
+                    await self.page.wait_for_load_state('networkidle')
+                    _LOGGER.info("✅ Dashboard loaded")
+                except Exception as e:
                 # Check if we're still on the login/OAuth page (login failed)
-                current_url = self.page.url
-                if "id.myaccount.psegliny.com/oauth2" in current_url:
-                    page_content = await self.page.content()
-                    if any(x in page_content.lower() for x in ["verification", "code", "multi-factor", "authenticate"]):
-                        self._log_mfa_error(current_url)
+                    current_url = self.page.url
+                    if "id.myaccount.psegliny.com/oauth2" in current_url:
+                        page_content = await self.page.content()
+                        if any(x in page_content.lower() for x in ["verification", "code", "multi-factor", "authenticate"]):
+                            self._log_mfa_error(current_url)
+                        else:
+                            _LOGGER.error(f"❌ Login failed - still on login page: {current_url}")
                     else:
-                        _LOGGER.error(f"❌ Login failed - still on login page: {current_url}")
-                    return False
-                else:
-                    _LOGGER.error(f"❌ Failed to reach dashboard: {current_url}")
+                        _LOGGER.error(f"❌ Failed to reach dashboard: {current_url}")
+                        try:
+                            with open("login_fail_debug.html", "w", encoding="utf-8") as debug_file:
+                                debug_file.write(await self.page.content())
+                            await self.page.screenshot(path="login_fail_debug.png", full_page=True)
+                            _LOGGER.error("Login diagnostics saved to login_fail_debug.html and login_fail_debug.png")
+                        except Exception as debug_error:
+                            _LOGGER.debug("Could not save login diagnostics: %s", debug_error)
                     return False
             
             # Step 5: Wait for exceptional dashboard to load and manually make redirect request
@@ -766,11 +809,13 @@ class PSEGAutoLogin:
     def format_cookies_for_api(self) -> str:
         """Format cookies in the format expected by the API."""
         try:
-            cookie_strings = []
-            if 'MM_SID' in self.login_cookies:
-                cookie_strings.append(f"MM_SID={self.login_cookies['MM_SID']}")
-            if '__RequestVerificationToken' in self.login_cookies:
-                cookie_strings.append(f"__RequestVerificationToken={self.login_cookies['__RequestVerificationToken']}")
+            # Keep the complete authenticated cookie jar. Smart Energy may use
+            # additional session cookies beyond MM_SID for Chart and ChartData.
+            cookie_strings = [
+                f"{name}={value}"
+                for name, value in self.login_cookies.items()
+                if name and value
+            ]
             
             if cookie_strings:
                 result = "; ".join(cookie_strings)
