@@ -7,9 +7,11 @@ A Home Assistant integration for monitoring energy usage from PSEG Long Island's
 - **Real-time Energy Monitoring**: Track your daily, weekly, and monthly energy consumption
 - **Peak vs Off-Peak Usage**: Monitor on-peak and off-peak energy usage patterns
 - **Historical Data**: Access up to 2 years of historical usage data
-- **Automatic Updates**: Data refreshes every 15 minutes
+- **Automatic Updates**: Session and latest usage refresh every 10 minutes
 - **Statistics Integration**: Full integration with Home Assistant's Statistics API
 - **Manual Refresh Service**: Service to manually update statistics and backfill historical data
+- **Period Summaries**: Today, yesterday, this week, last week, month, and rolling 7-day totals
+- **Usage Insights**: Daily average, change from the previous period, on-peak share, and estimated costs
 
 ## Installation
 
@@ -104,7 +106,23 @@ The integration provides the following data:
 - **Off-Peak Usage**: Energy consumption during off-peak hours
 - **On-Peak Usage**: Energy consumption during on-peak hours
 - **Historical Data**: Up to 2 years of usage history
-- **Real-time Updates**: Data refreshes every 15 minutes
+- **Recent Updates**: Latest available PSEG data refreshes every 10 minutes
+
+## Summary Sensors
+
+The integration automatically backfills 21 days on startup and exposes combined
+on/off-peak summaries including:
+
+- Today and yesterday usage and estimated cost
+- This week and last week usage and estimated cost (Sunday through Saturday)
+- This month usage and estimated cost
+- Rolling 7-day usage and the last seven complete days' daily average
+- Yesterday versus the previous day and last week versus the previous week
+- On-peak percentage for the last seven complete days
+
+Cost sensors use the configured `sensor.pseg_rate_194_peak` and
+`sensor.pseg_rate_194_off_peak` rates. They remain unavailable when either rate
+is missing.
 
 ## Troubleshooting
 

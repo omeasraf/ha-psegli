@@ -30,6 +30,7 @@ if HEADED:
 # Store in-progress MFA session (single session at a time)
 _mfa_session: Optional[PSEGAutoLogin] = None
 _mfa_lock = asyncio.Lock()
+_browser_lock = asyncio.Lock()
 
 class LoginRequest(BaseModel):
     username: str
@@ -39,6 +40,9 @@ class LoginRequest(BaseModel):
 
 class MfaRequest(BaseModel):
     code: str
+
+class SessionRefreshRequest(BaseModel):
+    cookie: Optional[str] = None
 
 class StatisticsTestRequest(BaseModel):
     cookie: str
@@ -147,47 +151,64 @@ async def test_statistics(request: StatisticsTestRequest):
 async def login(request: LoginRequest):
     """Login to PSEG and return cookies. If MFA is required, returns mfa_required=true - then POST to /login/mfa with the code."""
     global _mfa_session
-    try:
-        logger.info(f"Login attempt for user: {request.username}")
+    async with _browser_lock:
+        try:
+            logger.info(f"Login attempt for user: {request.username}")
         
-        # Clear any stale MFA session
-        if _mfa_session:
-            try:
-                await _mfa_session.cleanup()
-            except Exception:
-                pass
-            _mfa_session = None
+            # Clear any stale MFA session
+            if _mfa_session:
+                try:
+                    await _mfa_session.cleanup()
+                except Exception:
+                    pass
+                _mfa_session = None
         
-        # Use direct PSEGAutoLogin to support two-phase MFA flow
-        cookie_getter = PSEGAutoLogin(
-            email=request.username,
-            password=request.password,
-            mfa_code=request.mfa_code,
-            mfa_method=request.mfa_method or "sms",
-            headless=not HEADED,
-        )
-        result = await cookie_getter.get_cookies()
-        
-        if result == "MFA_REQUIRED":
-            _mfa_session = cookie_getter
-            logger.info("MFA required - waiting for code via POST /login/mfa")
-            return LoginResponse(
-                success=False,
-                mfa_required=True,
-                error="PSEG requires multi-factor authentication. Check your email or phone for the verification code, then POST to /login/mfa with the code."
+            # Use direct PSEGAutoLogin to support two-phase MFA flow
+            cookie_getter = PSEGAutoLogin(
+                email=request.username,
+                password=request.password,
+                mfa_code=request.mfa_code,
+                mfa_method=request.mfa_method or "sms",
+                headless=not HEADED,
             )
+            result = await cookie_getter.get_cookies()
+
+            if result == "MFA_REQUIRED":
+                _mfa_session = cookie_getter
+                logger.info("MFA required - waiting for code via POST /login/mfa")
+                return LoginResponse(
+                    success=False,
+                    mfa_required=True,
+                    error="PSEG requires multi-factor authentication. Check your email or phone for the verification code, then POST to /login/mfa with the code."
+                )
         
-        if result:
-            logger.info("Login successful, cookies obtained")
-            return LoginResponse(success=True, cookies=result)
-        else:
+            if result:
+                logger.info("Login successful, cookies obtained")
+                return LoginResponse(success=True, cookies=result)
             logger.warning("Login failed, no cookies returned")
             error_msg = getattr(cookie_getter, "last_error", None) or "Login failed"
             return LoginResponse(success=False, error=error_msg)
             
-    except Exception as e:
-        logger.error(f"Login error: {e}")
-        return LoginResponse(success=False, error=str(e))
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            return LoginResponse(success=False, error=str(e))
+
+@app.post("/session/refresh", response_model=LoginResponse)
+async def refresh_session(request: SessionRefreshRequest):
+    """Keep the saved browser session alive without submitting credentials."""
+    if _mfa_session:
+        return LoginResponse(success=False, error="MFA verification is in progress")
+
+    async with _browser_lock:
+        session = PSEGAutoLogin(email="", password="", headless=not HEADED)
+        cookies = await session.refresh_saved_session(request.cookie or "")
+        if cookies:
+            logger.info("Saved browser session refreshed successfully")
+            return LoginResponse(success=True, cookies=cookies)
+        return LoginResponse(
+            success=False,
+            error=session.last_error or "Saved browser session is unavailable",
+        )
 
 @app.post("/login/mfa", response_model=LoginResponse)
 async def login_mfa(request: MfaRequest):

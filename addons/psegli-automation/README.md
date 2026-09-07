@@ -2,12 +2,13 @@
 
 This Home Assistant addon provides automated login services for PSEG Long Island using Playwright. It runs in its own container and exposes a web API for cookie generation.
 
-**Version**: 2.4.5
+**Version**: 2.5.7
 
 ## Features
 
-- 🚀 **Automated Login**: Uses Playwright to handle reCAPTCHA and login
+- 🚀 **Automated Login**: Uses Playwright for the PSEG login flow
 - 🔐 **Cookie Generation**: Returns fresh authentication cookies
+- 🔄 **Session Keepalive**: Preserves a real browser profile and refreshes it before it expires
 - 🌐 **Web API**: Simple HTTP endpoints for integration use
 - 🐳 **Docker-based**: Runs in isolated container with all dependencies
 - 📱 **Home Assistant Integration**: Works seamlessly with PSEG Long Island integration
@@ -64,6 +65,21 @@ Content-Type: application/x-www-form-urlencoded
 username=your_email@example.com&password=your_password
 ```
 
+### Refresh Saved Session
+
+The integration calls this endpoint every 10 minutes. It can import the active
+Home Assistant cookie into the persistent browser profile, refresh that session,
+and return any rotated cookies without submitting credentials.
+
+```
+POST /session/refresh
+Content-Type: application/json
+
+{
+  "cookie": "MM_SID=...; __RequestVerificationToken=..."
+}
+```
+
 ## Response Format
 
 ```json
@@ -97,6 +113,7 @@ The addon keeps the browser session alive for a few minutes after step 1, so com
 - **Browser Issues**: Check addon logs for Playwright errors
 - **Network Issues**: Verify addon can reach PSEG website
 - **MFA Required**: If login fails with "still on login page", PSEG now requires MFA - use the two-step flow above
+- **reCAPTCHA Challenge**: The addon does not bypass interactive challenges. Once a valid session exists, the persistent profile and keepalive endpoint are designed to prevent repeated fresh logins that trigger them.
 
 ## Development
 

@@ -164,6 +164,33 @@ async def get_fresh_cookies(
         return None
 
 
+async def refresh_saved_session(cookie: str = "") -> Optional[str]:
+    """Keep the addon's persistent browser session alive without logging in."""
+    base_url = await get_addon_base_url()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/session/refresh",
+                json={"cookie": cookie or None},
+                timeout=LOGIN_TIMEOUT,
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Browser session refresh failed with status %s", resp.status)
+                    return None
+
+                result = await resp.json()
+                if result.get("success") and result.get("cookies"):
+                    return result["cookies"]
+                logger.debug(
+                    "Saved browser session was not refreshed: %s",
+                    result.get("error", "Unknown error"),
+                )
+                return None
+    except Exception as exc:
+        logger.warning("Failed to refresh saved browser session at %s: %s", base_url, exc)
+        return None
+
+
 async def complete_mfa_login(code: str) -> Optional[str]:
     """Complete login after MFA - provide the verification code from your email or SMS."""
     base_url = await get_addon_base_url()

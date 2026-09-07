@@ -5,10 +5,12 @@ Uses realistic browsing pattern to avoid detection and obtain authentication coo
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
 import time
+from http.cookies import SimpleCookie
 from typing import Optional, Dict, Any, List
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
@@ -20,6 +22,7 @@ except ImportError:
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else os.path.dirname(os.path.abspath(__file__)))
 STORAGE_STATE_PATH = os.path.join(DATA_DIR, "storage_state.json")
+BROWSER_PROFILE_PATH = os.path.join(DATA_DIR, "browser_profile")
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +49,7 @@ class PSEGAutoLogin:
         self.mfa_method = mfa_method.lower() if mfa_method else "sms"
         self.headless = headless
         self.storage_state_path = STORAGE_STATE_PATH
+        self.browser_profile_path = BROWSER_PROFILE_PATH
         self.last_error = None
         self.playwright = None
         self.browser = None
@@ -77,13 +81,10 @@ class PSEGAutoLogin:
                 '--disable-dev-shm-usage',
                 '--disable-infobars',
             ]
-            self.browser = await self.playwright.chromium.launch(
-                headless=self.headless,
-                args=launch_args,
-                ignore_default_args=['--enable-automation'],
-            )
-            
-            # Context options with stealth settings
+            # A persistent Chromium profile preserves more than Playwright's
+            # storage_state (browser identity, IndexedDB, service workers, etc.).
+            # That matters because PSEG otherwise sees every refresh as a new
+            # browser and is much more likely to present reCAPTCHA.
             context_kwargs = {
                 'viewport': {'width': 1920, 'height': 1080},
                 'locale': 'en-US',
@@ -94,15 +95,31 @@ class PSEGAutoLogin:
                     'height': 1080
                 }
             }
-            if os.path.exists(self.storage_state_path) and os.path.getsize(self.storage_state_path) > 0:
-                try:
-                    _LOGGER.info(f"📂 Loading saved browser storage state from {self.storage_state_path}")
-                    context_kwargs['storage_state'] = self.storage_state_path
-                except Exception as sse:
-                    _LOGGER.warning(f"Could not use storage state file: {sse}")
+            os.makedirs(self.browser_profile_path, exist_ok=True)
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                self.browser_profile_path,
+                headless=self.headless,
+                args=launch_args,
+                ignore_default_args=['--enable-automation'],
+                **context_kwargs,
+            )
 
-            # Create context
-            self.context = await self.browser.new_context(**context_kwargs)
+            # Import cookies from releases that only used storage_state.json.
+            # The persistent profile takes over after this first migration.
+            if (
+                os.path.exists(self.storage_state_path)
+                and os.path.getsize(self.storage_state_path) > 0
+                and not await self.context.cookies()
+            ):
+                try:
+                    with open(self.storage_state_path, encoding="utf-8") as state_file:
+                        legacy_state = json.load(state_file)
+                    legacy_cookies = legacy_state.get("cookies", [])
+                    if legacy_cookies:
+                        await self.context.add_cookies(legacy_cookies)
+                        _LOGGER.info("📂 Migrated saved cookies into the persistent browser profile")
+                except Exception as sse:
+                    _LOGGER.warning(f"Could not migrate saved browser state: {sse}")
             
             # Apply playwright-stealth if available
             if HAS_STEALTH:
@@ -112,8 +129,9 @@ class PSEGAutoLogin:
                 except Exception as ste:
                     _LOGGER.warning(f"Could not apply playwright-stealth: {ste}")
             
-            # Create page
-            self.page = await self.context.new_page()
+            # Persistent contexts can reopen their previous page. Reuse it so
+            # browser state is not needlessly discarded.
+            self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
             
             # Set up request interception
             await self.setup_request_interception()
@@ -124,6 +142,90 @@ class PSEGAutoLogin:
         except Exception as e:
             _LOGGER.error(f"Failed to setup browser: {e}")
             return False
+
+    @staticmethod
+    def _is_authenticated_dashboard(current_url: str, page_content: str) -> bool:
+        """Return whether the loaded page is an authenticated Smart Energy dashboard."""
+        page_content_lower = page_content.lower()
+        return (
+            "mysmartenergy.psegliny.com" in current_url
+            and "/dashboard" in current_url.lower()
+            and (
+                "__requestverificationtoken" in page_content_lower
+                or 'id="propertyselect"' in page_content_lower
+                or 'id="ajaxcontent"' in page_content_lower
+            )
+            and "loginemail" not in page_content_lower
+        )
+
+    async def _seed_smart_energy_cookies(self, cookie_string: str) -> None:
+        """Import an existing HA cookie header into the persistent browser profile."""
+        if not cookie_string:
+            return
+
+        parsed = SimpleCookie()
+        try:
+            parsed.load(cookie_string)
+        except Exception as exc:
+            _LOGGER.warning("Could not parse existing Home Assistant cookies: %s", exc)
+            return
+
+        cookies = [
+            {
+                "name": name,
+                "value": morsel.value,
+                "domain": ".mysmartenergy.psegliny.com",
+                "path": "/",
+                "secure": True,
+            }
+            for name, morsel in parsed.items()
+            if name and morsel.value
+        ]
+        if cookies:
+            await self.context.add_cookies(cookies)
+            _LOGGER.info("🍪 Imported the active Home Assistant session into the browser profile")
+
+    async def _capture_cookies_and_state(self) -> str:
+        """Capture the authenticated cookie jar and persist browser state."""
+        context_cookies = await self.context.cookies()
+        for cookie in context_cookies:
+            if cookie['domain'].lstrip('.').endswith('psegliny.com'):
+                self.login_cookies[cookie['name']] = cookie['value']
+
+        os.makedirs(os.path.dirname(self.storage_state_path), exist_ok=True)
+        await self.context.storage_state(path=self.storage_state_path, indexed_db=True)
+        _LOGGER.info("💾 Refreshed persistent browser session")
+        return self.format_cookies_for_api()
+
+    async def refresh_saved_session(self, cookie_string: str = "") -> Optional[str]:
+        """Keep an existing browser session alive without submitting credentials."""
+        try:
+            if not await self.setup_browser():
+                self.last_error = "Failed to set up browser for session refresh"
+                return None
+
+            await self._seed_smart_energy_cookies(cookie_string)
+            _LOGGER.info("🔄 Refreshing saved Smart Energy browser session...")
+            await self.page.goto(self.final_dashboard, wait_until='domcontentloaded')
+            try:
+                await self.page.wait_for_load_state('networkidle', timeout=10000)
+            except Exception:
+                pass
+
+            page_content = await self.page.content()
+            if not self._is_authenticated_dashboard(self.page.url, page_content):
+                self.last_error = "Saved browser session is not authenticated"
+                _LOGGER.warning("⚠️ Saved browser session is not authenticated; credentials were not submitted")
+                return None
+
+            cookies = await self._capture_cookies_and_state()
+            return cookies or None
+        except Exception as exc:
+            self.last_error = f"Saved session refresh failed: {exc}"
+            _LOGGER.warning("⚠️ %s", self.last_error)
+            return None
+        finally:
+            await self.cleanup()
     
     async def setup_request_interception(self):
         """Set up request interception to capture cookies and exceptional dashboard data."""
@@ -218,17 +320,8 @@ class PSEGAutoLogin:
             page_content = await self.page.content()
             page_content_lower = page_content.lower()
 
-            # Check if we are already authenticated on Smart Energy dashboard (e.g. from saved storage_state)
-            is_smart_energy_dashboard = (
-                "mysmartenergy.psegliny.com" in current_url
-                and "/dashboard" in current_url.lower()
-                and (
-                    "__requestverificationtoken" in page_content_lower
-                    or 'id="propertyselect"' in page_content_lower
-                    or 'id="ajaxcontent"' in page_content_lower
-                )
-                and "loginemail" not in page_content_lower
-            )
+            # Check if we are already authenticated on Smart Energy dashboard.
+            is_smart_energy_dashboard = self._is_authenticated_dashboard(current_url, page_content)
 
             if is_smart_energy_dashboard:
                 _LOGGER.info("✅ Already authenticated on Smart Energy dashboard (session active)")
@@ -600,20 +693,10 @@ class PSEGAutoLogin:
             _LOGGER.info("🍪 Step 6: Capturing cookies from final dashboard...")
             await asyncio.sleep(2.0)
             
-            # Get cookies from browser context
-            context_cookies = await self.context.cookies()
-            for cookie in context_cookies:
-                if cookie['domain'] in ['.psegliny.com', '.myaccount.psegliny.com', '.mysmartenergy.psegliny.com']:
-                    self.login_cookies[cookie['name']] = cookie['value']
-                    _LOGGER.info(f"🍪 Context cookie: {cookie['name']} = {cookie['value'][:50]}...")
-            
-            # Save storage state to preserve session across restarts
             try:
-                os.makedirs(os.path.dirname(self.storage_state_path), exist_ok=True)
-                await self.context.storage_state(path=self.storage_state_path)
-                _LOGGER.info(f"💾 Saved browser storage state to {self.storage_state_path}")
+                await self._capture_cookies_and_state()
             except Exception as se:
-                _LOGGER.debug(f"Could not save storage state: {se}")
+                _LOGGER.warning(f"Could not persist browser session: {se}")
             
             _LOGGER.info("✅ Realistic browsing pattern completed successfully")
             return True
@@ -845,10 +928,15 @@ class PSEGAutoLogin:
     async def cleanup(self):
         """Clean up browser resources."""
         try:
+            if self.context:
+                await self.context.close()
+                self.context = None
             if self.browser:
                 await self.browser.close()
+                self.browser = None
             if self.playwright:
                 await self.playwright.stop()
+                self.playwright = None
         except Exception as e:
             _LOGGER.warning(f"Error during cleanup: {e}")
 

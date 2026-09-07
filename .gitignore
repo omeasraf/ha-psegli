@@ -111,5 +111,6 @@ celerybeat.pid
 .dmypy.json
 dmypy.json 
 addons/psegli-automation/storage_state.json
+addons/psegli-automation/browser_profile/
 addons/psegli-automation/captcha_page_debug.html
 addons/psegli-automation/captcha_challenge.png

@@ -22,7 +22,13 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import DOMAIN, CONF_USERNAME, CONF_PASSWORD, CONF_COOKIE, CONF_MFA_METHOD
 from .psegli import InvalidAuth, PSEGLIClient
-from .auto_login import get_fresh_cookies, complete_mfa_login, check_addon_health, MFA_REQUIRED
+from .auto_login import (
+    MFA_REQUIRED,
+    check_addon_health,
+    complete_mfa_login,
+    get_fresh_cookies,
+    refresh_saved_session,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -431,7 +437,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Set up scheduled cookie keepalive and refresh every 10 minutes
     async def async_scheduled_cookie_refresh() -> None:
         """Automatically refresh cookies and keep session alive every 10 minutes.
-        Only refreshes via addon when the current cookie is invalid - avoids redundant logins.
+        Refreshes the saved browser session before it expires and only submits
+        credentials when neither the browser nor API session is usable.
         """
         _LOGGER.debug("Scheduled cookie refresh triggered")
         
@@ -444,15 +451,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.warning("No credentials available for scheduled cookie refresh")
                 return
             
-            # If we have a cookie, test it first - skip refresh if still valid
-            if cookie and entry.entry_id in hass.data.get(DOMAIN, {}):
-                current_client = hass.data[DOMAIN][entry.entry_id]
+            current_client = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+            if current_client:
+                # The requests client may have received rolling Set-Cookie values
+                # since the config entry was last stored.
+                cookie = current_client.cookie or cookie
+
+            # Keep the addon's real browser profile active. Supplying the current
+            # HA cookie also bootstraps the profile without a second login.
+            addon_healthy = await check_addon_health()
+            if addon_healthy and cookie:
+                browser_cookies = await refresh_saved_session(cookie)
+                if browser_cookies and current_client:
+                    current_client.update_cookie(browser_cookies)
+                    if hasattr(entry, 'runtime_data') and entry.runtime_data:
+                        coordinator = entry.runtime_data
+                        if hasattr(coordinator, 'client'):
+                            coordinator.client.update_cookie(browser_cookies)
+                    hass.config_entries.async_update_entry(
+                        entry,
+                        data={**entry.data, CONF_COOKIE: browser_cookies},
+                    )
+                    cookie = browser_cookies
+                    _LOGGER.debug("Saved PSEG browser session refreshed and persisted")
+
+            # Validate the current API session. A browser refresh may be
+            # unavailable during an add-on restart while this session still works.
+            if cookie and current_client:
                 try:
                     await current_client.test_connection()
-                    _LOGGER.debug("Cookie still valid, skipping cookie refresh (no MFA needed)")
+                    if current_client.cookie != entry.data.get(CONF_COOKIE, ""):
+                        hass.config_entries.async_update_entry(
+                            entry,
+                            data={**entry.data, CONF_COOKIE: current_client.cookie},
+                        )
+                        _LOGGER.debug("Persisted rolling cookies returned by PSEG")
+                    _LOGGER.debug("PSEG session is valid; no credential login needed")
                     # Still update statistics - energy data may have new readings
                     try:
                         await async_update_statistics_manual(type("Call", (), {"data": {"days_back": 0}})())
+                        if current_client.cookie != entry.data.get(CONF_COOKIE, ""):
+                            hass.config_entries.async_update_entry(
+                                entry,
+                                data={**entry.data, CONF_COOKIE: current_client.cookie},
+                            )
                         _LOGGER.debug("Statistics updated (cookie still valid)")
                     except Exception as stats_err:
                         _LOGGER.warning("Statistics update failed: %s", stats_err)
@@ -461,7 +503,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _LOGGER.debug("Cookie expired, proceeding with refresh")
             
             # Check if addon is healthy before attempting refresh
-            if not await check_addon_health():
+            if not addon_healthy:
                 _LOGGER.warning("Addon not available or unhealthy, skipping scheduled cookie refresh")
                 return
             
@@ -557,6 +599,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug("Global scheduled cookie refresh task already running, skipping duplicate")
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Seed enough recorder history for yesterday, last-week, and comparison
+    # sensors. Subsequent scheduled updates only request the latest day.
+    if cookie:
+        hass.async_create_task(
+            hass.services.async_call(
+                DOMAIN,
+                "update_statistics",
+                {"days_back": 21},
+                blocking=True,
+            )
+        )
+        _LOGGER.info("Scheduled initial 21-day PSEG statistics backfill")
     
     return True
 

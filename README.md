@@ -83,14 +83,14 @@ Once configured, the integration will:
 With optional AddOn:
 
 - Automatically log in to PSEG using the addon
-- Handle reCAPTCHA challenges transparently
-- Maintain authentication cookies automatically
+- Maintain a persistent browser session and authentication cookies automatically
 
 ## 🎯 **Features**
 
 - **🔐 Automated Authentication**: No manual cookie management needed
-- **🤖 reCAPTCHA Bypass**: Uses Playwright for automated login
+- **🌐 Persistent Browser Session**: Avoids unnecessary fresh logins that trigger reCAPTCHA
 - **📊 Energy Statistics**: Updates Home Assistant Energy Dashboard
+- **📈 Usage Summaries**: Yesterday, last week, rolling averages, comparisons, peak share, and costs
 - **🔄 Automatic Refresh**: Handles cookie expiration seamlessly
 - **⏱️ Real-time Data**: Hourly interval data from PSEG
 
@@ -98,7 +98,7 @@ With optional AddOn:
 
 1. **Initial Setup**: User enters PSEG credentials in integration setup
 2. **Addon Communication**: Integration calls addon API to get fresh cookies
-3. **Automated Login**: Addon uses Playwright to handle reCAPTCHA and login
+3. **Automated Login**: Addon uses Playwright for login and preserves the browser profile
 4. **Cookie Provision**: Addon returns valid authentication cookies
 5. **Data Fetching**: Integration uses cookies to call PSEG API
 6. **Automatic Refresh**: Process repeats when cookies expire

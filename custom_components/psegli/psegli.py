@@ -1,15 +1,16 @@
 """PSEG Long Island client."""
+
+import asyncio
 import json
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List
-import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
 
-from .const import ATTR_COMPARISON, ATTR_DESCRIPTION, ATTR_LAST_UPDATE
 from .exceptions import InvalidAuth
 
 _LOGGER = logging.getLogger(__name__)
@@ -45,10 +46,40 @@ class PSEGLIClient:
         self.session.headers.update({"Cookie": new_cookie})
         _LOGGER.debug("Updated client cookie to: %s", new_cookie[:50] + "..." if len(new_cookie) > 50 else new_cookie)
 
+    @staticmethod
+    def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
+        """Parse a Cookie header while preserving values that contain equals signs."""
+        cookies: dict[str, str] = {}
+        for item in cookie_header.split(";"):
+            if "=" not in item:
+                continue
+            name, value = item.strip().split("=", 1)
+            if name:
+                cookies[name] = value
+        return cookies
+
+    def _sync_response_cookies(self, response: requests.Response) -> None:
+        """Carry rolling Set-Cookie values into the explicit Cookie header."""
+        cookies = self._parse_cookie_header(self.cookie)
+        for item in [*response.history, response]:
+            for response_cookie in item.cookies:
+                if response_cookie.value:
+                    cookies[response_cookie.name] = response_cookie.value
+                else:
+                    cookies.pop(response_cookie.name, None)
+
+        refreshed_cookie = "; ".join(
+            f"{name}={value}" for name, value in cookies.items() if name and value
+        )
+        if refreshed_cookie and refreshed_cookie != self.cookie:
+            self.update_cookie(refreshed_cookie)
+            _LOGGER.debug("Applied refreshed cookies returned by PSEG")
+
     def _test_connection_sync(self) -> bool:
         """Test the connection to PSEG (synchronous)."""
         try:
             response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard")
+            self._sync_response_cookies(response)
             response.raise_for_status()
             
             # Check if we're redirected to login page
@@ -75,6 +106,7 @@ class PSEGLIClient:
     def _get_dashboard_page(self) -> tuple[str, str]:
         """Get the Dashboard page and extract RequestVerificationToken."""
         dashboard_response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard")
+        self._sync_response_cookies(dashboard_response)
         if dashboard_response.status_code != 200:
             raise InvalidAuth("Failed to get Dashboard page")
 
@@ -142,6 +174,7 @@ class PSEGLIClient:
         _LOGGER.debug("Chart setup data: %s", chart_setup_data)
         
         chart_setup_response = self.session.post(chart_setup_url, data=chart_setup_data)
+        self._sync_response_cookies(chart_setup_response)
         chart_setup_response.raise_for_status()
         
         # Check for redirect response in Chart/ request - if it redirects, the request failed
@@ -162,15 +195,25 @@ class PSEGLIClient:
             _LOGGER.error("Chart setup response is not JSON - request failed")
             raise InvalidAuth("Chart setup response is not JSON - request failed")
 
-    def _get_chart_data(self) -> dict[str, Any]:
+    def _get_chart_data(self, start_date: datetime, end_date: datetime) -> dict[str, Any]:
         """Get the actual chart data from PSEG."""
         chart_data_url = "https://mysmartenergy.psegliny.com/Dashboard/ChartData"
+        pseg_timezone = ZoneInfo("America/New_York")
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=pseg_timezone)
+        if end_date.tzinfo is None:
+            end_date = end_date.replace(tzinfo=pseg_timezone)
         chart_data_params = {
+            # These are the parameters used by PSEG's own Highcharts range
+            # handler. Supplying them makes historical backfills deterministic.
+            "unixTimeStart": int(start_date.timestamp() * 1000),
+            "unixTimeEnd": int(end_date.timestamp() * 1000),
             "_": int(datetime.now().timestamp() * 1000)  # Cache buster
         }
         
         _LOGGER.debug("Making ChartData/ request to get hourly data")
         chart_response = self.session.get(chart_data_url, params=chart_data_params)
+        self._sync_response_cookies(chart_response)
         chart_response.raise_for_status()
         
         # Debug: Log the response content
@@ -207,7 +250,7 @@ class PSEGLIClient:
             self._setup_chart_context(request_token, start_date, end_date)
             
             # Step 3: Get actual chart data
-            chart_data = self._get_chart_data()
+            chart_data = self._get_chart_data(start_date, end_date)
             
             # Create a minimal widget data structure since we're not fetching it
             widget_data = {"AjaxResults": []}
@@ -329,6 +372,4 @@ class PSEGLIClient:
                         "valid_points": valid_points  # Include the actual data points
                     }
 
-        return result 
-
- 
+        return result
