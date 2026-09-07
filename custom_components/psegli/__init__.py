@@ -26,7 +26,7 @@ from .auto_login import get_fresh_cookies, complete_mfa_login, check_addon_healt
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = []
+PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 async def get_last_cumulative_kwh(hass: HomeAssistant, statistic_id: str, before_timestamp: datetime) -> float:
     """Get the last recorded cumulative kWh for a given statistic_id BEFORE a specific timestamp."""
@@ -555,6 +555,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug("Started global scheduled cookie refresh task")
     else:
         _LOGGER.debug("Global scheduled cookie refresh task already running, skipping duplicate")
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     
     return True
 
@@ -656,12 +658,17 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
             # Determine which statistic this series maps to
             if "Off-Peak" in series_name:
                 statistic_id = "psegli:off_peak_usage"
+                cost_statistic_id = "psegli:off_peak_cost"
+                rate_entity_id = "sensor.pseg_rate_194_off_peak"
             elif "On-Peak" in series_name:
                 statistic_id = "psegli:on_peak_usage"
+                cost_statistic_id = "psegli:on_peak_cost"
+                rate_entity_id = "sensor.pseg_rate_194_peak"
             else:
                 continue  # Skip non-peak series
             
             statistics = []
+            cost_statistics = []
             
             # Check if this series has any meaningful data (non-zero values)
             non_zero_points = [point for point in valid_points if point.get("value", 0) > 0]
@@ -689,6 +696,24 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
             # Get the last cumulative sum before our first data point to ensure continuity
             _LOGGER.debug("Getting last cumulative sum for %s before %s", series_name, first_dt.strftime("%Y-%m-%d %H:%M"))
             cumulative_offset = await get_last_cumulative_kwh(hass, statistic_id, first_dt)
+
+            rate_state = hass.states.get(rate_entity_id)
+            try:
+                rate = float(rate_state.state) if rate_state is not None else None
+            except (TypeError, ValueError):
+                rate = None
+
+            if rate is None or rate <= 0:
+                _LOGGER.warning(
+                    "Skipping cost statistics for %s because %s is unavailable",
+                    series_name,
+                    rate_entity_id,
+                )
+                cumulative_cost_offset = None
+            else:
+                cumulative_cost_offset = await get_last_cumulative_kwh(
+                    hass, cost_statistic_id, first_dt
+                )
             
             _LOGGER.debug("Starting statistics processing for %s with %d points, continuing from cumulative offset %.6f", 
                          series_name, len(valid_points), cumulative_offset)
@@ -744,6 +769,13 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
                                 "start": start_time,        # Time block start
                                 "sum": cumulative_kwh,      # Cumulative total
                             })
+
+                            if cumulative_cost_offset is not None:
+                                cumulative_cost_offset += energy_value * rate
+                                cost_statistics.append({
+                                    "start": start_time,
+                                    "sum": cumulative_cost_offset,
+                                })
                             
                             # Update cumulative_offset for the next point
                             cumulative_offset = cumulative_kwh
@@ -802,6 +834,32 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
                     _LOGGER.debug("Successfully updated statistics for %s", statistic_id)
                 else:
                     _LOGGER.debug("Statistics update completed (non-awaitable result) for %s", statistic_id)
+
+                if cost_statistics:
+                    currency = getattr(hass.config, "currency", None) or "USD"
+                    cost_metadata = {
+                        "statistic_id": cost_statistic_id,
+                        "source": "psegli",
+                        "unit_of_measurement": currency,
+                        "unit_class": None,
+                        "has_mean": False,
+                        "mean_type": StatisticMeanType.NONE,
+                        "has_sum": True,
+                        "name": f"PSEG {series_name} Cost",
+                    }
+                    cost_result = async_add_external_statistics(
+                        hass,
+                        cost_metadata,
+                        cost_statistics,
+                    )
+                    if hasattr(cost_result, '__await__'):
+                        await cost_result
+                    _LOGGER.debug(
+                        "Successfully updated cost statistics for %s at %.6f %s/kWh",
+                        cost_statistic_id,
+                        rate,
+                        currency,
+                    )
                 
                 # Verify statistics were stored by checking again
                 _LOGGER.debug("Verifying statistics were stored by checking again...")
@@ -863,6 +921,8 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
     # Unload the coordinator
     if entry.runtime_data:
         await entry.runtime_data.async_shutdown()
@@ -895,4 +955,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_remove(DOMAIN, "refresh_cookie")
     hass.services.async_remove(DOMAIN, "enter_mfa_code")
     
-    return True
+    return unload_ok
