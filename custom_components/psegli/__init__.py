@@ -192,7 +192,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.debug("PSEG connection test successful")
         except InvalidAuth as e:
             _LOGGER.error("Authentication failed: %s", e)
-            raise ConfigEntryAuthFailed("Invalid authentication")
+            # Try to recover immediately from a fresh add-on login before surfacing setup failure.
+            try:
+                refreshed_cookie = await get_fresh_cookies(username, password, mfa_method=entry.data.get(CONF_MFA_METHOD, "sms"))
+                if refreshed_cookie == MFA_REQUIRED:
+                    channel = "phone" if entry.data.get(CONF_MFA_METHOD, "sms") == "sms" else "email"
+                    mfa_pending = True
+                    cookie = ""
+                    hass.config_entries.async_update_entry(
+                        entry,
+                        data={**entry.data, CONF_COOKIE: ""},
+                    )
+                    _LOGGER.info(
+                        "PSEG requires MFA during setup - wait for %s code and complete via enter_mfa_code service",
+                        channel,
+                    )
+                    await hass.async_create_task(
+                        hass.services.async_call(
+                            "persistent_notification",
+                            "create",
+                            {
+                                "title": "PSEG Integration: MFA Required",
+                                "message": f"PSEG sent a verification code to your {channel}. Go to Developer Tools > Actions and call 'PSEG Long Island: Enter MFA Code' with the code.",
+                                "notification_id": "psegli_mfa_required",
+                            },
+                        )
+                    )
+                elif refreshed_cookie:
+                    cookie = refreshed_cookie
+                    client.update_cookie(cookie)
+                    hass.config_entries.async_update_entry(
+                        entry,
+                        data={**entry.data, CONF_COOKIE: cookie},
+                    )
+                    if hasattr(entry, "runtime_data") and entry.runtime_data:
+                        coordinator = entry.runtime_data
+                        if hasattr(coordinator, "client"):
+                            coordinator.client.update_cookie(cookie)
+                else:
+                    _LOGGER.error("Could not refresh cookie during setup")
+                    raise ConfigEntryAuthFailed("Invalid authentication")
+            except ConfigEntryAuthFailed:
+                raise
+            except Exception as refresh_error:
+                _LOGGER.error("Failed to refresh cookie during setup: %s", refresh_error)
+                raise ConfigEntryAuthFailed("Invalid authentication") from refresh_error
     
     # Create coordinator for automatic updates (like Opower)
     coordinator = PSEGCoordinator(hass, entry, client)
@@ -211,6 +255,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Manually update statistics table with PSEG data (for backfilling)."""
         days_back = call.data.get("days_back", 0)
         _LOGGER.info("Statistics update started (days_back: %d)", days_back)
+        username = entry.data.get(CONF_USERNAME)
+        password = entry.data.get(CONF_PASSWORD)
+        mfa_method = entry.data.get(CONF_MFA_METHOD, "sms")
+        channel = "phone" if mfa_method == "sms" else "email"
         
         try:
             # Get the current client instance from hass.data (which gets updated during cookie refresh)
@@ -231,7 +279,57 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 
         except InvalidAuth as e:
             _LOGGER.error("Authentication failed during update: %s", e)
-            _LOGGER.debug("Cookie refresh will be attempted at the next scheduled time (every 10 minutes)")
+            _LOGGER.debug("Attempting immediate addon cookie refresh before retrying")
+
+            if not await check_addon_health():
+                _LOGGER.warning("Addon unavailable, cannot refresh cookie right now")
+                return
+            if not username or not password:
+                _LOGGER.error("No credentials available for cookie refresh")
+                return
+
+            cookies = await get_fresh_cookies(username, password, mfa_method=mfa_method)
+            if cookies == MFA_REQUIRED:
+                _LOGGER.warning(
+                    "PSEG requires MFA during statistics refresh - check %s for code, then call enter_mfa_code service",
+                    channel,
+                )
+                await hass.async_create_task(
+                    hass.services.async_call(
+                        "persistent_notification",
+                        "create",
+                        {
+                            "title": "PSEG Integration: MFA Required",
+                            "message": f"PSEG sent a verification code to your {channel}. Check your {channel}, then go to Developer Tools > Services and call 'PSEG Long Island: Enter MFA Code' with the code.",
+                            "notification_id": "psegli_mfa_required",
+                        },
+                    )
+                )
+                return
+
+            if not cookies:
+                _LOGGER.warning("Failed to refresh cookie from addon")
+                return
+
+            # Apply the new cookie and retry this update immediately.
+            if entry.entry_id in hass.data.get(DOMAIN, {}):
+                current_client.update_cookie(cookies)
+                if hasattr(entry, "runtime_data") and entry.runtime_data:
+                    coordinator = entry.runtime_data
+                    if hasattr(coordinator, "client"):
+                        coordinator.client.update_cookie(cookies)
+            hass.config_entries.async_update_entry(
+                entry,
+                data={**entry.data, CONF_COOKIE: cookies},
+            )
+            _LOGGER.debug("Retrying statistics update with refreshed cookie")
+
+            historical_data = await current_client.get_usage_data(days_back=days_back)
+            if "chart_data" in historical_data:
+                await _process_chart_data(hass, historical_data["chart_data"])
+                _LOGGER.info("Statistics update completed successfully after refresh")
+            else:
+                _LOGGER.warning("No chart data found in response after refresh")
             
         except Exception as e:
             _LOGGER.error("Failed to update statistics: %s", e)

@@ -9,10 +9,13 @@ import json
 import logging
 import os
 import random
+import subprocess
+import tempfile
 import time
 from http.cookies import SimpleCookie
 from typing import Optional, Dict, Any, List
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+import speech_recognition as sr
 
 try:
     from playwright_stealth import Stealth
@@ -261,6 +264,93 @@ class PSEGAutoLogin:
         
         # Continue with the request
         await route.continue_()
+
+    @staticmethod
+    def _recognize_audio(audio_bytes: bytes) -> str:
+        """Convert a reCAPTCHA MP3 challenge to WAV and transcribe it."""
+        recognizer = sr.Recognizer()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mp3_path = os.path.join(temp_dir, "challenge.mp3")
+            wav_path = os.path.join(temp_dir, "challenge.wav")
+            with open(mp3_path, "wb") as audio_file:
+                audio_file.write(audio_bytes)
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3_path, wav_path],
+                check=True,
+            )
+            with sr.AudioFile(wav_path) as source:
+                audio = recognizer.record(source)
+        return recognizer.recognize_google(audio)
+
+    async def _solve_recaptcha_audio(self) -> bool:
+        """Attempt the no-key audio challenge path using SpeechRecognition."""
+        try:
+            anchor_frame = next(
+                (frame for frame in self.page.frames if "api2/anchor" in frame.url),
+                None,
+            )
+            if not anchor_frame:
+                return False
+
+            checkbox = anchor_frame.locator("#recaptcha-anchor")
+            if await checkbox.count() and not await checkbox.is_checked():
+                await checkbox.click()
+                await asyncio.sleep(1)
+
+            challenge_frame = next(
+                (frame for frame in self.page.frames if "api2/bframe" in frame.url),
+                None,
+            )
+            if not challenge_frame:
+                return False
+
+            audio_button = challenge_frame.locator("#recaptcha-audio-button")
+            if not await audio_button.count() or not await audio_button.is_visible():
+                return False
+            await audio_button.click()
+
+            audio_link = challenge_frame.locator(
+                "#audio-source, .rc-audiochallenge-tdownload-link"
+            ).first
+            await audio_link.wait_for(state="visible", timeout=10000)
+            audio_url = await audio_link.get_attribute("src") or await audio_link.get_attribute("href")
+            if not audio_url:
+                return False
+
+            audio_response = await self.page.request.get(audio_url)
+            if not audio_response.ok:
+                return False
+            transcript = await asyncio.to_thread(
+                self._recognize_audio, await audio_response.body()
+            )
+            _LOGGER.info("🎙️ Transcribed reCAPTCHA audio challenge")
+            await challenge_frame.locator("#audio-response").fill(transcript)
+            await challenge_frame.locator("#recaptcha-verify-button").click()
+            await asyncio.sleep(2)
+            return True
+        except Exception as exc:
+            _LOGGER.warning("SpeechRecognition CAPTCHA solve failed; keeping manual fallback: %s", exc)
+            return False
+
+    async def _dismiss_access_banner(self) -> None:
+        """Dismiss the sticky access-message banner when it overlays the login form."""
+        banner = self.page.locator("#errorMessageHousing")
+        try:
+            if not await banner.count() or not await banner.is_visible():
+                return
+
+            close_button = banner.locator("button.btn-close, button[aria-label='Close']")
+            if await close_button.count() and await close_button.is_visible():
+                await close_button.click(force=True)
+                _LOGGER.debug("Dismissed PSEG access-message banner")
+
+            # Some responses leave the sticky wrapper in the DOM after closing.
+            if await banner.is_visible():
+                await banner.evaluate(
+                    "element => element.style.setProperty('display', 'none', 'important')"
+                )
+        except Exception as exc:
+            _LOGGER.debug("Could not dismiss PSEG access-message banner: %s", exc)
     
     def _log_mfa_error(self, current_url: str):
         """Log clear error when MFA is required."""
@@ -319,6 +409,7 @@ class PSEGAutoLogin:
             current_url = self.page.url
             page_content = await self.page.content()
             page_content_lower = page_content.lower()
+            await self._dismiss_access_banner()
 
             # Check if we are already authenticated on Smart Energy dashboard.
             is_smart_energy_dashboard = self._is_authenticated_dashboard(current_url, page_content)
@@ -397,8 +488,20 @@ class PSEGAutoLogin:
                 login_success = False
                 for poll_i in range(max_polls):
                     await asyncio.sleep(1.0)
-                    current_url = self.page.url
-                    page_content = await self.page.content()
+                    try:
+                        current_url = self.page.url
+                        page_content = await self.page.content()
+                    except Exception as exc:
+                        # The login click can start a redirect while the
+                        # document is being replaced. Treat this as a
+                        # transient state and inspect the page on the next
+                        # polling interval instead of failing the whole flow.
+                        _LOGGER.debug(
+                            "Login page is still navigating at poll %s: %s",
+                            poll_i + 1,
+                            exc,
+                        )
+                        continue
                     page_content_lower = page_content.lower()
 
                     # 1. Success check: Dashboard loaded and login form is gone
@@ -425,6 +528,8 @@ class PSEGAutoLogin:
                         pass
 
                     if challenge_visible:
+                        if await self._solve_recaptcha_audio():
+                            continue
                         if not self.headless:
                             if poll_i % 10 == 0:
                                 _LOGGER.info(f"🧩 Interactive reCAPTCHA puzzle active on screen. Please solve it in the browser! ({poll_i}s elapsed)")

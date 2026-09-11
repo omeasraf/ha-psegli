@@ -119,6 +119,13 @@ SENSORS = (
     PSEGPeriodSensorDescription("week_cost", "This Week Cost", "week", TOTAL_COST, "cost"),
     PSEGPeriodSensorDescription("last_week_cost", "Last Week Cost", "last_week", TOTAL_COST, "cost"),
     PSEGPeriodSensorDescription("month_cost", "This Month Cost", "month", TOTAL_COST, "cost"),
+    PSEGPeriodSensorDescription(
+        "rolling_7_day_cost",
+        "Rolling 7-Day Cost",
+        "rolling_7_days",
+        TOTAL_COST,
+        "cost",
+    ),
 )
 
 

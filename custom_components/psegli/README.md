@@ -116,7 +116,7 @@ on/off-peak summaries including:
 - Today and yesterday usage and estimated cost
 - This week and last week usage and estimated cost (Sunday through Saturday)
 - This month usage and estimated cost
-- Rolling 7-day usage and the last seven complete days' daily average
+- Rolling 7-day usage and estimated cost, plus the last seven complete days' daily average
 - Yesterday versus the previous day and last week versus the previous week
 - On-peak percentage for the last seven complete days
 

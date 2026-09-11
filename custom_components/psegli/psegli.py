@@ -30,14 +30,6 @@ class PSEGLIClient:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "en-US,en;q=0.8",
-            "X-Requested-With": "XMLHttpRequest",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Ch-Ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Brave";v="138"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"macOS"',
-            "Sec-Gpc": "1"
         })
 
     def update_cookie(self, new_cookie: str) -> None:
@@ -81,9 +73,19 @@ class PSEGLIClient:
             response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard")
             self._sync_response_cookies(response)
             response.raise_for_status()
+            response_text = response.text.lower()
+            response_url = response.url.lower()
+            content_type = response.headers.get("Content-Type", "").lower()
+            response_len = len(response_text)
+            
+            if (
+                "text/plain" in content_type
+                and response_len < 200
+            ):
+                raise InvalidAuth("Unexpected plaintext response from Dashboard endpoint")
             
             # Check if we're redirected to login page
-            if "login" in response.url.lower() or "signin" in response.url.lower():
+            if "login" in response_url or "signin" in response_url or "sign in" in response_text:
                 _LOGGER.error("Cookie rejected - redirected to login page")
                 raise InvalidAuth("Cookie rejected - redirected to login page")
             
@@ -107,11 +109,27 @@ class PSEGLIClient:
         """Get the Dashboard page and extract RequestVerificationToken."""
         dashboard_response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard")
         self._sync_response_cookies(dashboard_response)
+        content_type = dashboard_response.headers.get("Content-Type", "unknown")
+        response_text = dashboard_response.text
+        response_len = len(response_text)
         if dashboard_response.status_code != 200:
-            raise InvalidAuth("Failed to get Dashboard page")
+            raise InvalidAuth(f"Failed to get Dashboard page: HTTP {dashboard_response.status_code}")
+
+        if (
+            "text/plain" in content_type.lower()
+            and response_len < 200
+            and "dashboard" in dashboard_response.url.lower()
+        ):
+            _LOGGER.error(
+                "Unexpected plaintext response from /Dashboard (status=%s, content_type=%s, length=%d, preview=%r)",
+                dashboard_response.status_code,
+                content_type,
+                response_len,
+                response_text[:120],
+            )
+            raise InvalidAuth("Unexpected plaintext response while loading Dashboard")
 
         response_url = dashboard_response.url.lower()
-        response_text = dashboard_response.text
         response_text_lower = response_text.lower()
         if "login" in response_url or "signin" in response_url or "sign in" in response_text_lower:
             raise InvalidAuth("Authentication cookie expired or was rejected")
@@ -124,12 +142,16 @@ class PSEGLIClient:
         request_token = token_tag.get("value") if token_tag else None
         if not request_token:
             # Keep a tolerant fallback for malformed HTML responses.
-            token_match = re.search(
+            token_patterns = (
                 r"__RequestVerificationToken[^>]+value=['\"]([^'\"]+)['\"]",
-                response_text,
-                flags=re.IGNORECASE,
+                r"value=['\"]([^'\"]+)['\"][^>]+name=['\"]__RequestVerificationToken['\"]",
+                r"__RequestVerificationToken['\"]?\s*[:=]\s*['\"]([^'\"]+)",
             )
-            request_token = token_match.group(1) if token_match else None
+            for token_pattern in token_patterns:
+                token_match = re.search(token_pattern, response_text, flags=re.IGNORECASE)
+                request_token = token_match.group(1) if token_match else None
+                if request_token:
+                    break
 
         if request_token:
             _LOGGER.debug("Found RequestVerificationToken: %s...", request_token[:20])
@@ -137,8 +159,8 @@ class PSEGLIClient:
             _LOGGER.error(
                 "Could not find RequestVerificationToken on /Dashboard (url=%s, content_type=%s, length=%d, title=%s)",
                 dashboard_response.url,
-                dashboard_response.headers.get("Content-Type", "unknown"),
-                len(response_text),
+                content_type,
+                response_len,
                 BeautifulSoup(response_text, "html.parser").title.get_text(strip=True)
                 if BeautifulSoup(response_text, "html.parser").title
                 else "unknown",
