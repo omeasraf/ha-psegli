@@ -331,7 +331,13 @@ class PSEGAutoLogin:
             ).first
             # #audio-source is often an <audio> element, which is attached but
             # intentionally not visible. The download link is a fallback.
-            await audio_link.wait_for(state="attached", timeout=10000)
+            try:
+                await audio_link.wait_for(state="attached", timeout=10000)
+            except Exception:
+                # Some challenge variants use a nested <source> under <audio>.
+                source_element = challenge_frame.locator("audio source").first
+                await source_element.wait_for(state="attached", timeout=10000)
+                audio_link = source_element
             audio_url = await audio_link.get_attribute("src") or await audio_link.get_attribute("href")
             if not audio_url:
                 return False
@@ -503,7 +509,9 @@ class PSEGAutoLogin:
                 await login_submit_button.click()
 
                 # Poll for login outcome (allow up to 120s in headed mode for user to solve challenge)
-                max_polls = 120 if not self.headless else 35
+                # Keep the same timeout in both modes so CAPTCHA retries and
+                # challenge appearance are handled consistently.
+                max_polls = 120
                 _LOGGER.info(f"🔄 Waiting up to {max_polls}s for login response / dashboard...")
                 login_success = False
                 for poll_i in range(max_polls):
@@ -539,9 +547,13 @@ class PSEGAutoLogin:
                     # 2. Check for real on-screen interactive reCAPTCHA puzzle (not the badge!)
                     challenge_visible = False
                     try:
-                        for cf in await self.page.locator('iframe[title*="recaptcha challenge"], iframe[src*="bframe"]').all():
-                            box = await cf.bounding_box()
-                            if box and box['width'] > 200 and box['height'] > 200 and box['y'] >= 0:
+                        challenge_locators = self.page.locator(
+                            'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
+                        )
+                        for i in range(await challenge_locators.count()):
+                            challenge_frame_locator = challenge_locators.nth(i)
+                            box = await challenge_frame_locator.bounding_box()
+                            if box and box["width"] > 200 and box["height"] > 200 and box["y"] >= 0:
                                 challenge_visible = True
                                 break
                     except Exception:
