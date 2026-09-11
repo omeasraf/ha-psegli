@@ -14,6 +14,7 @@ import tempfile
 import time
 from http.cookies import SimpleCookie
 from typing import Optional, Dict, Any, List
+from urllib.parse import urljoin
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 import speech_recognition as sr
 
@@ -297,25 +298,34 @@ class PSEGAutoLogin:
                 await checkbox.click()
                 await asyncio.sleep(1)
 
-            challenge_frame = next(
-                (frame for frame in self.page.frames if "api2/bframe" in frame.url),
-                None,
-            )
+            challenge_frame = None
+            for _ in range(10):
+                challenge_frame = next(
+                    (frame for frame in self.page.frames if "api2/bframe" in frame.url),
+                    None,
+                )
+                if challenge_frame:
+                    break
+                await asyncio.sleep(0.5)
             if not challenge_frame:
                 return False
 
             audio_button = challenge_frame.locator("#recaptcha-audio-button")
-            if not await audio_button.count() or not await audio_button.is_visible():
+            if not await audio_button.count():
                 return False
+            await audio_button.wait_for(state="visible", timeout=10000)
             await audio_button.click()
 
             audio_link = challenge_frame.locator(
                 "#audio-source, .rc-audiochallenge-tdownload-link"
             ).first
-            await audio_link.wait_for(state="visible", timeout=10000)
+            # #audio-source is often an <audio> element, which is attached but
+            # intentionally not visible. The download link is a fallback.
+            await audio_link.wait_for(state="attached", timeout=10000)
             audio_url = await audio_link.get_attribute("src") or await audio_link.get_attribute("href")
             if not audio_url:
                 return False
+            audio_url = urljoin(self.page.url, audio_url)
 
             audio_response = await self.page.request.get(audio_url)
             if not audio_response.ok:
