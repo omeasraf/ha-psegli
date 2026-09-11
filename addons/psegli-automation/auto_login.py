@@ -286,18 +286,8 @@ class PSEGAutoLogin:
     async def _solve_recaptcha_audio(self) -> bool:
         """Attempt the no-key audio challenge path using SpeechRecognition."""
         try:
-            anchor_frame = next(
-                (frame for frame in self.page.frames if "api2/anchor" in frame.url),
-                None,
-            )
-            if not anchor_frame:
-                return False
-
-            checkbox = anchor_frame.locator("#recaptcha-anchor")
-            if await checkbox.count() and not await checkbox.is_checked():
-                await checkbox.click()
-                await asyncio.sleep(1)
-
+            # Reuse an already-open challenge. Clicking the anchor again while
+            # the puzzle is open can reset it before its audio controls load.
             challenge_frame = None
             for _ in range(10):
                 challenge_frame = next(
@@ -307,6 +297,26 @@ class PSEGAutoLogin:
                 if challenge_frame:
                     break
                 await asyncio.sleep(0.5)
+
+            if not challenge_frame:
+                anchor_frame = next(
+                    (frame for frame in self.page.frames if "api2/anchor" in frame.url),
+                    None,
+                )
+                if not anchor_frame:
+                    return False
+
+                checkbox = anchor_frame.locator("#recaptcha-anchor")
+                if await checkbox.count() and not await checkbox.is_checked():
+                    await checkbox.click()
+                for _ in range(10):
+                    challenge_frame = next(
+                        (frame for frame in self.page.frames if "api2/bframe" in frame.url),
+                        None,
+                    )
+                    if challenge_frame:
+                        break
+                    await asyncio.sleep(0.5)
             if not challenge_frame:
                 return False
 
