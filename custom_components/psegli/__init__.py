@@ -690,7 +690,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Use a global flag that persists across reloads to prevent multiple tasks
     if 'global_scheduled_task_running' not in hass.data:
         hass.data['global_scheduled_task_running'] = True
-        task = hass.async_create_task(refresh_cookies_scheduled())
+        task = hass.async_create_background_task(
+            refresh_cookies_scheduled(),
+            name=f"{DOMAIN}_cookie_refresh",
+            eager_start=False,
+        )
         hass.data['global_scheduled_task'] = task
         _LOGGER.debug("Started global scheduled cookie refresh task")
     else:
@@ -701,13 +705,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Seed enough recorder history for yesterday, last-week, and comparison
     # sensors. Subsequent scheduled updates only request the latest day.
     if cookie:
-        hass.async_create_task(
+        hass.async_create_background_task(
             hass.services.async_call(
                 DOMAIN,
                 "update_statistics",
                 {"days_back": 21},
                 blocking=True,
-            )
+            ),
+            name=f"{DOMAIN}_initial_statistics",
+            eager_start=False,
         )
         _LOGGER.info("Scheduled initial 21-day PSEG statistics backfill")
     
