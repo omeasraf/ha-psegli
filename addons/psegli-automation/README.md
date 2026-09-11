@@ -2,7 +2,7 @@
 
 This Home Assistant addon provides automated login services for PSEG Long Island using Playwright. It runs in its own container and exposes a web API for cookie generation.
 
-**Version**: 2.5.8
+**Version**: 2.5.11
 
 ## Features
 
@@ -18,7 +18,6 @@ This Home Assistant addon provides automated login services for PSEG Long Island
 ### **Option 1: Repository Installation (Recommended)**
 
 1. **Add the custom repository:**
-
    - Go to **Settings** → **Add-ons** → **Add-on Store**
    - Click the three dots menu (⋮) → **Repositories**
    - Add: `https://github.com/daswass/ha-psegli`
@@ -134,6 +133,7 @@ HEADED=1 python run.py
 ```
 
 Then in another terminal:
+
 1. `curl -X POST http://localhost:8000/login -H "Content-Type: application/json" -d '{"username":"your@email.com","password":"yourpass"}'`
 2. When you get the SMS code, `curl -X POST http://localhost:8000/login/mfa -H "Content-Type: application/json" -d '{"code":"123456"}'`
 
