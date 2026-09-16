@@ -54,8 +54,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-# Run the addon in headed mode by default so CAPTCHA can be solved reliably.
-ENV HEADED=1
+# The Home Assistant app must bring up its API immediately. Headed mode remains
+# available for local debugging by setting HEADED=1 and running under Xvfb.
+ENV HEADED=0
 
-# Run the application
-CMD ["xvfb-run", "--auto-servernum", "python", "run.py"]
+CMD ["python", "run.py"]

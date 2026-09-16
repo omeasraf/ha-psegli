@@ -63,12 +63,19 @@ async def _discover_addon_base_url(session: aiohttp.ClientSession) -> Optional[s
     return None
 
 
-async def get_addon_base_url(force_refresh: bool = False) -> str:
+async def get_addon_base_url(force_refresh: bool = False) -> Optional[str]:
     """Resolve the addon base URL, preferring the internal Docker hostname on HA OS."""
     global _resolved_addon_url
+    has_supervisor = bool(os.environ.get("SUPERVISOR_TOKEN"))
 
     if _resolved_addon_url and not force_refresh:
-        return _resolved_addon_url
+        # If we already resolved a URL this session, verify it is still available before
+        # returning it. If it is unhealthy we clear the cache and re-discover.
+        async with aiohttp.ClientSession() as session:
+            if await _check_url_health(session, _resolved_addon_url):
+                return _resolved_addon_url
+        logger.debug("Cached addon URL is unhealthy, clearing cache: %s", _resolved_addon_url)
+        _resolved_addon_url = None
 
     candidates: list[str] = []
     async with aiohttp.ClientSession() as session:
@@ -78,11 +85,16 @@ async def get_addon_base_url(force_refresh: bool = False) -> str:
 
         candidates.extend(
             [
+                "http://aa0a6fcb-psegli-automation:8000",
+                "http://aa0a6fcb-psegli-automation.local.hass.io:8000",
                 "http://801d8584-psegli-automation:8000",
                 "http://psegli-automation:8000",
-                DEFAULT_ADDON_URL,
             ]
         )
+
+        # In local development (no Supervisor token), allow localhost fallback.
+        if not has_supervisor:
+            candidates.append(DEFAULT_ADDON_URL)
 
         seen: set[str] = set()
         for base_url in candidates:
@@ -93,6 +105,13 @@ async def get_addon_base_url(force_refresh: bool = False) -> str:
                 _resolved_addon_url = base_url
                 logger.info("Using PSEG automation addon at %s", base_url)
                 return base_url
+
+    if has_supervisor:
+        logger.warning(
+            "Could not reach PSEG automation addon from Home Assistant supervisor context"
+        )
+        _resolved_addon_url = None
+        return None
 
     logger.warning(
         "Could not reach PSEG automation addon; falling back to %s",
@@ -105,6 +124,8 @@ async def get_addon_base_url(force_refresh: bool = False) -> str:
 async def check_addon_health() -> bool:
     """Check if the addon is available and healthy."""
     base_url = await get_addon_base_url()
+    if not base_url:
+        return False
     async with aiohttp.ClientSession() as session:
         return await _check_url_health(session, base_url)
 
@@ -121,7 +142,12 @@ async def get_fresh_cookies(
         Cookie string on success, MFA_REQUIRED when MFA is needed (call complete_mfa_login),
         or None on failure.
     """
-    base_url = await get_addon_base_url()
+    base_url = await get_addon_base_url(force_refresh=True)
+    if not base_url:
+        logger.warning(
+            "PSEG automation add-on unavailable in Home Assistant; check add-on status and start it"
+        )
+        return None
     if not await check_addon_health():
         logger.warning("Addon not available or unhealthy at %s", base_url)
         return None
@@ -167,6 +193,11 @@ async def get_fresh_cookies(
 async def refresh_saved_session(cookie: str = "") -> Optional[str]:
     """Keep the addon's persistent browser session alive without logging in."""
     base_url = await get_addon_base_url()
+    if not base_url:
+        logger.warning(
+            "Cannot refresh session; PSEG automation add-on is unavailable in Home Assistant context"
+        )
+        return None
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -194,6 +225,9 @@ async def refresh_saved_session(cookie: str = "") -> Optional[str]:
 async def complete_mfa_login(code: str) -> Optional[str]:
     """Complete login after MFA - provide the verification code from your email or SMS."""
     base_url = await get_addon_base_url()
+    if not base_url:
+        logger.error("Cannot complete MFA; PSEG automation add-on is unavailable in Home Assistant context")
+        return None
     try:
         logger.debug("Sending MFA code to %s/login/mfa", base_url)
         async with aiohttp.ClientSession() as session:

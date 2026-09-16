@@ -15,9 +15,10 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, CONF_USERNAME, CONF_PASSWORD, CONF_COOKIE, CONF_MFA_METHOD
@@ -33,6 +34,10 @@ from .auto_login import (
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
+COOKIE_REFRESH_INTERVAL_SECONDS = 10 * 60
+_COOKIE_REFRESH_LISTENER_KEY = f"{DOMAIN}_cookie_refresh_unsub"
+_COOKIE_REFRESH_USERS_KEY = f"{DOMAIN}_cookie_refresh_users"
+_COOKIE_REFRESH_LOCK_KEY = f"{DOMAIN}_cookie_refresh_lock"
 
 async def get_last_cumulative_kwh(hass: HomeAssistant, statistic_id: str, before_timestamp: datetime) -> float:
     """Get the last recorded cumulative kWh for a given statistic_id BEFORE a specific timestamp."""
@@ -666,39 +671,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:
             _LOGGER.error("Failed to refresh cookie during scheduled refresh: %s", e)
     
-    # Set up scheduled cookie keepalive and refresh every 10 minutes
-    async def refresh_cookies_scheduled():
-        """Refresh cookies / keepalive session at scheduled intervals (every 10 minutes)."""
-        while True:
-            now = datetime.now()
-            
-            next_minute = ((now.minute // 10) + 1) * 10
-            if next_minute >= 60:
-                next_refresh = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-            else:
-                next_refresh = now.replace(minute=next_minute, second=0, microsecond=0)
-            
-            wait_seconds = max(1.0, (next_refresh - now).total_seconds())
-            _LOGGER.debug("Next scheduled cookie keepalive/refresh at %s (in %.0f seconds)", 
-                         next_refresh.strftime("%H:%M"), wait_seconds)
-            
-            await asyncio.sleep(wait_seconds)
-            
-            await async_scheduled_cookie_refresh()
-    
-    # Start the scheduled cookie refresh task AFTER all services are registered
-    # Use a global flag that persists across reloads to prevent multiple tasks
-    if 'global_scheduled_task_running' not in hass.data:
-        hass.data['global_scheduled_task_running'] = True
-        task = hass.async_create_background_task(
-            refresh_cookies_scheduled(),
-            name=f"{DOMAIN}_cookie_refresh",
-            eager_start=False,
+    # Keep a single global cookie refresh loop across entries (to avoid duplicate tasks).
+    domain_state = hass.data[DOMAIN]
+    domain_state[_COOKIE_REFRESH_USERS_KEY] = domain_state.get(
+        _COOKIE_REFRESH_USERS_KEY, 0
+    ) + 1
+
+    @callback
+    def _stop_cookie_refresh_listener(_event=None) -> None:
+        if _COOKIE_REFRESH_USERS_KEY in domain_state:
+            domain_state.pop(_COOKIE_REFRESH_USERS_KEY, None)
+        unsub = domain_state.pop(_COOKIE_REFRESH_LISTENER_KEY, None)
+        if unsub:
+            unsub()
+            _LOGGER.debug("Stopped shared cookie refresh interval listener")
+
+        refresh_lock = domain_state.pop(_COOKIE_REFRESH_LOCK_KEY, None)
+        if refresh_lock is not None and refresh_lock.locked():
+            _LOGGER.debug("A scheduled cookie refresh is in progress; it will complete naturally")
+
+    @callback
+    def _scheduled_cookie_refresh_tick(_now: datetime | None = None) -> None:
+        """Run one scheduled cookie refresh cycle."""
+        refresh_lock = domain_state.setdefault(_COOKIE_REFRESH_LOCK_KEY, asyncio.Lock())
+        if refresh_lock.locked():
+            _LOGGER.debug("Skipping scheduled cookie refresh tick because one is already running")
+            return
+
+        async def _do_refresh() -> None:
+            async with refresh_lock:
+                await async_scheduled_cookie_refresh()
+
+        hass.async_create_task(_do_refresh())
+
+    if _COOKIE_REFRESH_LISTENER_KEY not in domain_state:
+        domain_state[_COOKIE_REFRESH_LISTENER_KEY] = async_track_time_interval(
+            hass,
+            _scheduled_cookie_refresh_tick,
+            timedelta(minutes=10),
         )
-        hass.data['global_scheduled_task'] = task
-        _LOGGER.debug("Started global scheduled cookie refresh task")
-    else:
-        _LOGGER.debug("Global scheduled cookie refresh task already running, skipping duplicate")
+        _LOGGER.debug(
+            "Started shared periodic cookie refresh listener (interval=%ds)",
+            COOKIE_REFRESH_INTERVAL_SECONDS,
+        )
+
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _stop_cookie_refresh_listener)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -1090,24 +1107,22 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if DOMAIN in hass.data and 'coordinator' in hass.data[DOMAIN]:
         del hass.data[DOMAIN]['coordinator']
     
-    # Clean up global scheduled task flag if this is the last instance
-    if 'global_scheduled_task_running' in hass.data:
-        # Check if there are other instances running
-        other_instances = [e for e in hass.config_entries.async_entries(DOMAIN) if e.entry_id != entry.entry_id]
-        if not other_instances:
-            # Cancel the running scheduled task
-            if 'global_scheduled_task' in hass.data:
-                try:
-                    task = hass.data['global_scheduled_task']
-                    if not task.done():
-                        task.cancel()
-                        _LOGGER.debug("Cancelled global scheduled cookie refresh task")
-                except Exception as e:
-                    _LOGGER.warning("Error cancelling global scheduled task: %s", e)
-                del hass.data['global_scheduled_task']
-            
-            del hass.data['global_scheduled_task_running']
-            _LOGGER.debug("Cleaned up global scheduled task flag (last instance)")
+    # Clean up global scheduled cookie refresh listener when the last entry unloads.
+    domain_data = hass.data.get(DOMAIN, {})
+    users = domain_data.get(_COOKIE_REFRESH_USERS_KEY, 0)
+    if users:
+        users = max(0, int(users) - 1)
+        domain_data[_COOKIE_REFRESH_USERS_KEY] = users
+        if users == 0:
+            unsub = domain_data.pop(_COOKIE_REFRESH_LISTENER_KEY, None)
+            if unsub:
+                unsub()
+                _LOGGER.debug("Stopped shared periodic cookie refresh listener")
+            domain_data.pop(_COOKIE_REFRESH_USERS_KEY, None)
+            lock = domain_data.get(_COOKIE_REFRESH_LOCK_KEY)
+            if lock is not None and lock.locked():
+                _LOGGER.debug("A scheduled cookie refresh is in progress during unload; it will complete naturally")
+            domain_data.pop(_COOKIE_REFRESH_LOCK_KEY, None)
     
     # Remove the services
     hass.services.async_remove(DOMAIN, "update_statistics")
