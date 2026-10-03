@@ -31,7 +31,7 @@ This integration uses a **two-component approach**:
 
    - Go to **Settings** → **Add-ons** → **Add-on Store**
    - Click the three dots menu (⋮) → **Repositories**
-   - Add: `https://github.com/daswass/ha-psegli`
+   - Add: `https://github.com/omeasraf/ha-psegli`
    - Click **Add**
 
 2. **Install the addon:**
@@ -96,7 +96,7 @@ With optional AddOn:
 - **📊 Energy Statistics**: Updates Home Assistant Energy Dashboard
 - **📈 Usage Summaries**: Yesterday, last week, rolling averages, comparisons, peak share, and costs
 - **🔄 Session Recovery**: Reuses existing cookies and the saved browser session
-- **⏱️ Real-time Data**: Hourly interval data from PSEG
+- **⏱️ Hourly Data**: Usage is assigned to PSEG's New York local hour, including daylight saving changes. PSEG may publish readings several hours after the meter interval.
 
 ## 🔍 **How It Works**
 

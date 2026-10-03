@@ -679,7 +679,14 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
                 value = point.get("value", 0)
                 if not isinstance(timestamp, datetime):
                     continue
-                hour = timestamp.replace(minute=0, second=0, microsecond=0)
+                if timestamp.tzinfo is None:
+                    _LOGGER.warning("Skipping PSEG reading without a timezone")
+                    continue
+                # Bucket after conversion to UTC, so the two 1 AM hours when
+                # daylight saving time ends remain distinct recorder hours.
+                hour = timestamp.astimezone(timezone.utc).replace(
+                    minute=0, second=0, microsecond=0
+                )
                 hourly_points[hour] = hourly_points.get(hour, 0.0) + max(0.0, float(value or 0))
             valid_points = [
                 {"timestamp": timestamp, "value": value}

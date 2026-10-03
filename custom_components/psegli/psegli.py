@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -15,6 +15,17 @@ from bs4 import BeautifulSoup
 from .exceptions import InvalidAuth, PSEGLIError
 
 _LOGGER = logging.getLogger(__name__)
+PSEG_TIMEZONE = ZoneInfo("America/New_York")
+
+
+def _pseg_wall_clock_milliseconds(value: datetime) -> int:
+    """Encode a New York wall time the way Smart Energy labels chart points."""
+    local = (
+        value.replace(tzinfo=PSEG_TIMEZONE)
+        if value.tzinfo is None
+        else value.astimezone(PSEG_TIMEZONE)
+    )
+    return int(local.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
 
 class PSEGLIClient:
@@ -228,16 +239,15 @@ class PSEGLIClient:
     def _get_chart_data(self, start_date: datetime, end_date: datetime) -> dict[str, Any]:
         """Get the actual chart data from PSEG."""
         chart_data_url = "https://mysmartenergy.psegliny.com/Dashboard/ChartData"
-        pseg_timezone = ZoneInfo("America/New_York")
         if start_date.tzinfo is None:
-            start_date = start_date.replace(tzinfo=pseg_timezone)
+            start_date = start_date.replace(tzinfo=PSEG_TIMEZONE)
         if end_date.tzinfo is None:
-            end_date = end_date.replace(tzinfo=pseg_timezone)
+            end_date = end_date.replace(tzinfo=PSEG_TIMEZONE)
         chart_data_params = {
             # These are the parameters used by PSEG's own Highcharts range
             # handler. Supplying them makes historical backfills deterministic.
-            "unixTimeStart": int(start_date.timestamp() * 1000),
-            "unixTimeEnd": int(end_date.timestamp() * 1000),
+            "unixTimeStart": _pseg_wall_clock_milliseconds(start_date),
+            "unixTimeEnd": _pseg_wall_clock_milliseconds(end_date),
             "_": int(datetime.now().timestamp() * 1000)  # Cache buster
         }
         
@@ -269,14 +279,24 @@ class PSEGLIClient:
         """Get usage data from PSEG (synchronous)."""
         try:
             # Calculate date range based on days_back parameter
-            if days_back == 0:
-                # Yesterday to today (accounting for data lag)
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=1)
+            # Keep explicit backfill ranges, and interpret default dates in the
+            # utility's timezone instead of the Home Assistant host timezone.
+            end_date = end_date or datetime.now(PSEG_TIMEZONE)
+            if end_date.tzinfo is None:
+                end_date = end_date.replace(tzinfo=PSEG_TIMEZONE)
             else:
-                # days_back days ago to now
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=days_back)
+                end_date = end_date.astimezone(PSEG_TIMEZONE)
+            if start_date is None:
+                start_date = (
+                    (end_date.astimezone(PSEG_TIMEZONE) - timedelta(days=days_back))
+                    .replace(hour=0, minute=0, second=0, microsecond=0)
+                    if days_back
+                    else end_date - timedelta(days=1)
+                )
+            if start_date.tzinfo is None:
+                start_date = start_date.replace(tzinfo=PSEG_TIMEZONE)
+            else:
+                start_date = start_date.astimezone(PSEG_TIMEZONE)
             
             _LOGGER.debug("Date calculation: days_back=%d, start_date=%s, end_date=%s", 
                         days_back, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
@@ -365,18 +385,25 @@ class PSEGLIClient:
                 _LOGGER.debug("Processing series: %s with %d data points", series_name, len(data_points))
                 
                 valid_points = []
+                seen_wall_times: dict[datetime, int] = {}
                 for i, point in enumerate(data_points):
                     if isinstance(point, dict) and "x" in point and "y" in point:
                         # Object format: hourly data with proper structure
                         timestamp = point["x"] / 1000
                         value = point["y"]
-                        # Replace None values with 0 to ensure continuous data flow
+                        # A missing reading is not measured zero usage.
                         if value is None:
-                            value = 0
-                        # Timestamps need to be shifted by +4 hours to align with actual peak hours
-                        # Raw timestamp shows 11:00 AM but should be 3:00 PM for peak hours
-                        shifted_timestamp = timestamp + (4 * 3600)  # Add 4 hours
-                        local_time = datetime.fromtimestamp(shifted_timestamp)
+                            continue
+                        # PSEG encodes local wall-clock labels as UTC epoch
+                        # milliseconds. Its 15:00 point is the 3 PM peak hour
+                        # in New York, not 11 AM EDT. Attach the local zone to
+                        # that wall time; ZoneInfo supplies the correct offset
+                        # in both summer and winter.
+                        wall_time = datetime.fromtimestamp(timestamp, timezone.utc)
+                        wall_time = wall_time.replace(tzinfo=None)
+                        fold = min(seen_wall_times.get(wall_time, 0), 1)
+                        seen_wall_times[wall_time] = seen_wall_times.get(wall_time, 0) + 1
+                        local_time = wall_time.replace(tzinfo=PSEG_TIMEZONE, fold=fold)
                         valid_points.append({
                             "timestamp": local_time,
                             "value": value

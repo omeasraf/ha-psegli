@@ -108,22 +108,22 @@ class PSEGAutoLogin:
                 **context_kwargs,
             )
 
-            # Import cookies from releases that only used storage_state.json.
-            # The persistent profile takes over after this first migration.
+            # Session cookies are not reliably restored by Chromium after a
+            # browser exit. Reimport the last saved Playwright state every time
+            # so a refreshed Smart Energy session survives addon restarts.
             if (
                 os.path.exists(self.storage_state_path)
                 and os.path.getsize(self.storage_state_path) > 0
-                and not await self.context.cookies()
             ):
                 try:
                     with open(self.storage_state_path, encoding="utf-8") as state_file:
                         legacy_state = json.load(state_file)
-                    legacy_cookies = legacy_state.get("cookies", [])
-                    if legacy_cookies:
-                        await self.context.add_cookies(legacy_cookies)
-                        _LOGGER.info("📂 Migrated saved cookies into the persistent browser profile")
+                    saved_cookies = legacy_state.get("cookies", [])
+                    if saved_cookies:
+                        await self.context.add_cookies(saved_cookies)
+                        _LOGGER.info("📂 Restored saved browser cookies into the persistent profile")
                 except Exception as sse:
-                    _LOGGER.warning(f"Could not migrate saved browser state: {sse}")
+                    _LOGGER.warning("Could not restore saved browser state: %s", sse)
             
             # Apply playwright-stealth if available
             if HAS_STEALTH:

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
@@ -17,9 +18,9 @@ from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator,
 )
-from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
+PSEG_TIMEZONE = ZoneInfo("America/New_York")
 
 SCAN_INTERVAL = timedelta(minutes=1)
 
@@ -201,7 +202,7 @@ class PSEGRecorderCoordinator(DataUpdateCoordinator[dict[str, list[dict[str, Any
         )
 
     async def _async_update_data(self) -> dict[str, list[dict[str, Any]]]:
-        now_local = dt_util.now()
+        now_local = datetime.now(PSEG_TIMEZONE)
         start_local = now_local - timedelta(days=45)
         result = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
@@ -283,7 +284,9 @@ class PSEGPeriodSensor(CoordinatorEntity[PSEGRecorderCoordinator], SensorEntity)
     @property
     def native_value(self) -> float | None:
         """Calculate the current summary from the shared recorder snapshot."""
-        start_local, end_local = _period_range(self._description.period, dt_util.now())
+        start_local, end_local = _period_range(
+            self._description.period, datetime.now(PSEG_TIMEZONE)
+        )
         start = start_local.astimezone(timezone.utc)
         end = end_local.astimezone(timezone.utc)
         values = self._component_values(start, end)
@@ -314,7 +317,9 @@ class PSEGPeriodSensor(CoordinatorEntity[PSEGRecorderCoordinator], SensorEntity)
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose date boundaries and tariff breakdowns for dashboards."""
-        start, end = _period_range(self._description.period, dt_util.now())
+        start, end = _period_range(
+            self._description.period, datetime.now(PSEG_TIMEZONE)
+        )
         attributes: dict[str, Any] = {
             "period_start": start.isoformat(),
             "period_end": end.isoformat(),
