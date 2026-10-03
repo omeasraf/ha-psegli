@@ -47,7 +47,7 @@ A Home Assistant integration for monitoring energy usage from PSEG Long Island's
 
 The integration stores your authentication cookie and will use it for all API requests. When the cookie expires:
 
-1. **Automatic Refresh**: If the automation addon is available and healthy, the integration will automatically attempt to get a new cookie
+1. **Saved Session Recovery**: If the automation addon has a valid browser session, the integration can refresh the cookie without submitting credentials
 2. **Manual Update**: You can manually update the cookie by going to **Settings** > **Devices & Services** > **PSEG Long Island** > **Configure**
 3. **Direct Cookie Input**: You can manually obtain a cookie from your browser and enter it directly
 
@@ -57,7 +57,7 @@ To update your configuration:
 
 1. Go to **Settings** > **Devices & Services** > **PSEG Long Island**
 2. Click **Configure**
-3. **Update Cookie**: Enter a new cookie directly, or leave empty to attempt automatic refresh via addon
+3. **Update Cookie**: Enter a new cookie directly, or select `refresh_via_addon` to request a new browser login
 4. Click **Submit**
 
 ## Services
@@ -132,7 +132,7 @@ is missing.
 
    - Your cookie has expired
    - Go to **Settings** > **Devices & Services** > **PSEG Long Island** > **Configure**
-   - Update your cookie or let the integration attempt automatic refresh
+   - Update your cookie or explicitly request a fresh login through Configure
 
 2. **No Data Available**
 
@@ -156,9 +156,9 @@ logger:
 
 ## Automation Addon
 
-This integration can optionally work with the PSEG Long Island Automation Addon to automatically refresh expired cookies. The addon is not required for the integration to function, but it provides:
+This integration can optionally work with the PSEG Long Island Automation Addon to refresh a saved browser session. The addon is not required when a valid cookie is supplied. It provides:
 
-- **Automatic Cookie Refresh**: Automatically obtains new cookies when they expire
+- **Saved Session Refresh**: Obtains rotated cookies without a new credential login when the browser session remains valid
 - **Headless Operation**: No need to manually extract cookies from your browser
 - **Reliable Authentication**: Maintains continuous access to your PSEG data
 

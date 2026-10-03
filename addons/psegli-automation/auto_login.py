@@ -191,10 +191,12 @@ class PSEGAutoLogin:
 
     async def _capture_cookies_and_state(self) -> str:
         """Capture the authenticated cookie jar and persist browser state."""
-        context_cookies = await self.context.cookies()
+        # Chromium applies domain/path rules here. Cookies from the account
+        # login domain must not be sent in a raw Smart Energy Cookie header.
+        context_cookies = await self.context.cookies([self.final_dashboard])
+        self.login_cookies.clear()
         for cookie in context_cookies:
-            if cookie['domain'].lstrip('.').endswith('psegliny.com'):
-                self.login_cookies[cookie['name']] = cookie['value']
+            self.login_cookies[cookie['name']] = cookie['value']
 
         os.makedirs(os.path.dirname(self.storage_state_path), exist_ok=True)
         await self.context.storage_state(path=self.storage_state_path, indexed_db=True)
@@ -218,9 +220,23 @@ class PSEGAutoLogin:
 
             page_content = await self.page.content()
             if not self._is_authenticated_dashboard(self.page.url, page_content):
-                self.last_error = "Saved browser session is not authenticated"
-                _LOGGER.warning("⚠️ Saved browser session is not authenticated; credentials were not submitted")
-                return None
+                # Smart Energy's own session can expire while My Account's
+                # remembered sign-in is still valid. Use its normal SSO handoff
+                # to mint a new Smart Energy session without submitting a password.
+                _LOGGER.info("Smart Energy cookie expired; trying My Account SSO handoff")
+                await self.page.goto(self.mysmartenergy_redirect, wait_until='domcontentloaded')
+                try:
+                    await self.page.wait_for_url(
+                        lambda url: "mysmartenergy.psegliny.com/Dashboard" in url,
+                        timeout=20000,
+                    )
+                except Exception:
+                    pass
+                page_content = await self.page.content()
+                if not self._is_authenticated_dashboard(self.page.url, page_content):
+                    self.last_error = "Saved browser and My Account sessions are not authenticated"
+                    _LOGGER.warning("⚠️ Saved browser session is not authenticated; credentials were not submitted")
+                    return None
 
             cookies = await self._capture_cookies_and_state()
             return cookies or None
@@ -989,12 +1005,7 @@ class PSEGAutoLogin:
             await self.page.wait_for_load_state('networkidle', timeout=10000)
             await asyncio.sleep(3.0)
             
-            context_cookies = await self.context.cookies()
-            for cookie in context_cookies:
-                if cookie['domain'] in ['.psegliny.com', '.myaccount.psegliny.com', '.mysmartenergy.psegliny.com']:
-                    self.login_cookies[cookie['name']] = cookie['value']
-            
-            return self.format_cookies_for_api()
+            return await self._capture_cookies_and_state()
         except Exception as e:
             _LOGGER.error("MFA continuation failed: %s (type: %s)", e, type(e).__name__)
             _LOGGER.error("Current URL at failure: %s", self.page.url if self.page else "no page")
@@ -1015,7 +1026,7 @@ class PSEGAutoLogin:
             
             if cookie_strings:
                 result = "; ".join(cookie_strings)
-                _LOGGER.info(f"🍪 Formatted cookies for API: {result[:100]}...")
+                _LOGGER.info("Formatted Smart Energy cookies for API")
                 return result
             else:
                 _LOGGER.warning("⚠️ No valid cookies to format for API")
@@ -1045,9 +1056,6 @@ class PSEGAutoLogin:
             # Check if we got the cookies we need
             if self.login_cookies:
                 _LOGGER.info("✅ SUCCESS: Got cookies from realistic browsing pattern")
-                for name, value in self.login_cookies.items():
-                    _LOGGER.info(f"🍪 {name}: {value[:50]}...")
-                
                 # Format cookies for API use
                 return self.format_cookies_for_api()
             else:

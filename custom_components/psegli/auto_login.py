@@ -174,7 +174,7 @@ async def get_fresh_cookies(
                     return None
 
                 result = await resp.json()
-                logger.debug("Addon response: %s", result)
+                logger.debug("Addon login response: success=%s, mfa_required=%s", result.get("success"), result.get("mfa_required"))
                 if result.get("success") and result.get("cookies"):
                     logger.debug("Successfully obtained cookies from addon")
                     return result["cookies"]

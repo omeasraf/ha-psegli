@@ -17,6 +17,7 @@
     "mfa_failed": "MFA verification failed. The code may be invalid or expired.",
     "addon_unavailable": "Addon not available. Please ensure the PSEG automation addon is installed and running.",
     "addon_failed": "Addon failed to get cookies.",
+    "cookie_or_refresh_required": "Enter a Smart Energy cookie or select refresh_via_addon to request a new browser login.",
     "credentials_not_found": "No username or password configured. Please reconfigure the integration."
   },
   "abort": {

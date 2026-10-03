@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "PSEG Long Island",
+        "description": "Use your PSEG account credentials. You can also provide a cookie from a signed-in Smart Energy browser.",
+        "data": {
+          "username": "PSEG username or email",
+          "password": "PSEG password",
+          "cookie": "Smart Energy cookie (optional)",
+          "mfa_method": "Verification method"
+        }
+      },
+      "mfa": {
+        "title": "PSEG verification",
+        "data": {
+          "mfa_code": "Verification code"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "The PSEG session was rejected.",
+      "unknown": "PSEG setup failed. Check the Home Assistant logs.",
+      "mfa_code_required": "Enter the verification code.",
+      "mfa_failed": "PSEG verification failed."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Refresh PSEG session",
+        "description": "Paste a cookie from your signed-in Smart Energy browser, or choose one new add-on login. A new browser login may show a CAPTCHA.",
+        "data": {
+          "cookie": "Smart Energy cookie",
+          "refresh_via_addon": "Try a new add-on browser login",
+          "mfa_method": "Verification method"
+        }
+      },
+      "mfa": {
+        "title": "PSEG verification",
+        "data": {
+          "mfa_code": "Verification code"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "The PSEG session was rejected.",
+      "cookie_or_refresh_required": "Enter a cookie or choose a new add-on login.",
+      "addon_unavailable": "The PSEG add-on is unavailable.",
+      "addon_failed": "The PSEG add-on could not sign in.",
+      "credentials_not_found": "PSEG credentials are missing from this entry.",
+      "mfa_code_required": "Enter the verification code.",
+      "mfa_failed": "PSEG verification failed.",
+      "unknown": "PSEG setup failed. Check the Home Assistant logs."
+    }
+  }
+}

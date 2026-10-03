@@ -6,12 +6,13 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
 
-from .exceptions import InvalidAuth
+from .exceptions import InvalidAuth, PSEGLIError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ class PSEGLIClient:
         """Update the cookie in this client instance."""
         self.cookie = new_cookie
         self.session.headers.update({"Cookie": new_cookie})
-        _LOGGER.debug("Updated client cookie to: %s", new_cookie[:50] + "..." if len(new_cookie) > 50 else new_cookie)
+        _LOGGER.debug("Updated client cookie")
 
     @staticmethod
     def _parse_cookie_header(cookie_header: str) -> dict[str, str]:
@@ -70,11 +71,14 @@ class PSEGLIClient:
     def _test_connection_sync(self) -> bool:
         """Test the connection to PSEG (synchronous)."""
         try:
-            response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard")
+            response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard", timeout=30)
             self._sync_response_cookies(response)
+            if response.status_code in (401, 403):
+                raise InvalidAuth("Dashboard rejected the current session")
             response.raise_for_status()
             response_text = response.text.lower()
             response_url = response.url.lower()
+            response_path = urlparse(response_url).path.rstrip("/")
             content_type = response.headers.get("Content-Type", "").lower()
             response_len = len(response_text)
             
@@ -82,10 +86,10 @@ class PSEGLIClient:
                 "text/plain" in content_type
                 and response_len < 200
             ):
-                raise InvalidAuth("Unexpected plaintext response from Dashboard endpoint")
+                raise PSEGLIError("Unexpected plaintext response from Dashboard endpoint")
             
             # Check if we're redirected to login page
-            if "login" in response_url or "signin" in response_url or "sign in" in response_text:
+            if response_path != "/dashboard" or "loginemail" in response_text:
                 _LOGGER.error("Cookie rejected - redirected to login page")
                 raise InvalidAuth("Cookie rejected - redirected to login page")
             
@@ -93,7 +97,7 @@ class PSEGLIClient:
             return True
         except requests.exceptions.RequestException as err:
             _LOGGER.error("Failed to connect to PSEG: %s", err)
-            raise InvalidAuth("Invalid authentication") from err
+            raise PSEGLIError("Failed to connect to PSEG") from err
 
     async def test_connection(self) -> bool:
         """Test the connection to PSEG (async wrapper)."""
@@ -107,31 +111,27 @@ class PSEGLIClient:
 
     def _get_dashboard_page(self) -> tuple[str, str]:
         """Get the Dashboard page and extract RequestVerificationToken."""
-        dashboard_response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard")
+        dashboard_response = self.session.get("https://mysmartenergy.psegliny.com/Dashboard", timeout=30)
         self._sync_response_cookies(dashboard_response)
         content_type = dashboard_response.headers.get("Content-Type", "unknown")
         response_text = dashboard_response.text
         response_len = len(response_text)
+        if dashboard_response.status_code in (401, 403):
+            raise InvalidAuth("Dashboard rejected the current session")
         if dashboard_response.status_code != 200:
-            raise InvalidAuth(f"Failed to get Dashboard page: HTTP {dashboard_response.status_code}")
+            raise PSEGLIError(f"Failed to get Dashboard page: HTTP {dashboard_response.status_code}")
 
         if (
             "text/plain" in content_type.lower()
             and response_len < 200
             and "dashboard" in dashboard_response.url.lower()
         ):
-            _LOGGER.error(
-                "Unexpected plaintext response from /Dashboard (status=%s, content_type=%s, length=%d, preview=%r)",
-                dashboard_response.status_code,
-                content_type,
-                response_len,
-                response_text[:120],
-            )
-            raise InvalidAuth("Unexpected plaintext response while loading Dashboard")
+            raise PSEGLIError("Unexpected plaintext response while loading Dashboard")
 
         response_url = dashboard_response.url.lower()
+        response_path = urlparse(response_url).path.rstrip("/")
         response_text_lower = response_text.lower()
-        if "login" in response_url or "signin" in response_url or "sign in" in response_text_lower:
+        if response_path != "/dashboard" or "loginemail" in response_text_lower:
             raise InvalidAuth("Authentication cookie expired or was rejected")
         
         # Extract the token from the page
@@ -154,7 +154,7 @@ class PSEGLIClient:
                     break
 
         if request_token:
-            _LOGGER.debug("Found RequestVerificationToken: %s...", request_token[:20])
+            _LOGGER.debug("Found RequestVerificationToken")
         else:
             _LOGGER.error(
                 "Could not find RequestVerificationToken on /Dashboard (url=%s, content_type=%s, length=%d, title=%s)",
@@ -165,7 +165,7 @@ class PSEGLIClient:
                 if BeautifulSoup(response_text, "html.parser").title
                 else "unknown",
             )
-            raise InvalidAuth("Could not find RequestVerificationToken on /Dashboard")
+            raise PSEGLIError("Could not find RequestVerificationToken on /Dashboard")
         
         return dashboard_response.text, request_token
 
@@ -193,29 +193,37 @@ class PSEGLIClient:
         
         _LOGGER.debug("Making Chart/ setup request with hourly granularity (start: %s, end: %s)", 
                     start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
-        _LOGGER.debug("Chart setup data: %s", chart_setup_data)
-        
-        chart_setup_response = self.session.post(chart_setup_url, data=chart_setup_data)
+        chart_setup_response = self.session.post(
+            chart_setup_url,
+            data=chart_setup_data,
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": "https://mysmartenergy.psegliny.com",
+            },
+            timeout=30,
+        )
         self._sync_response_cookies(chart_setup_response)
+        if chart_setup_response.status_code in (401, 403):
+            raise InvalidAuth("Chart request rejected the current session")
         chart_setup_response.raise_for_status()
+        if "login" in chart_setup_response.url.lower() or "signin" in chart_setup_response.url.lower():
+            raise InvalidAuth("Chart request redirected to sign in")
         
         # Check for redirect response in Chart/ request - if it redirects, the request failed
         try:
             chart_setup_json = json.loads(chart_setup_response.text)
+            if not isinstance(chart_setup_json, dict):
+                raise PSEGLIError("Unexpected Chart response")
             if "AjaxResults" in chart_setup_json and chart_setup_json["AjaxResults"]:
                 for result in chart_setup_json["AjaxResults"]:
                     if result.get("Action") == "Redirect":
-                        _LOGGER.error("Chart setup request FAILED - redirected to: %s", result.get('Value'))
-                        _LOGGER.error(
-                            "Chart setup response: status=%s content_type=%s body=%s",
-                            chart_setup_response.status_code,
-                            chart_setup_response.headers.get("Content-Type", "unknown"),
-                            chart_setup_response.text[:500],
-                        )
-                        _LOGGER.warning("Continuing to ChartData; PSEG may already have the requested chart context")
+                        target = str(result.get("Value", "")).lower()
+                        if target.rstrip("/") == "" or "login" in target or "signin" in target:
+                            raise InvalidAuth("Chart request redirected to sign in")
+                        raise PSEGLIError("Chart request was redirected")
         except json.JSONDecodeError:
-            _LOGGER.error("Chart setup response is not JSON - request failed")
-            raise InvalidAuth("Chart setup response is not JSON - request failed")
+            raise PSEGLIError("Chart setup response is not JSON") from None
 
     def _get_chart_data(self, start_date: datetime, end_date: datetime) -> dict[str, Any]:
         """Get the actual chart data from PSEG."""
@@ -234,24 +242,32 @@ class PSEGLIClient:
         }
         
         _LOGGER.debug("Making ChartData/ request to get hourly data")
-        chart_response = self.session.get(chart_data_url, params=chart_data_params)
+        chart_response = self.session.get(
+            chart_data_url,
+            params=chart_data_params,
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=30,
+        )
         self._sync_response_cookies(chart_response)
+        if chart_response.status_code in (401, 403):
+            raise InvalidAuth("Chart data rejected the current session")
         chart_response.raise_for_status()
-        
-        # Debug: Log the response content
-        _LOGGER.debug("ChartData response status: %s", chart_response.status_code)
-        _LOGGER.debug("ChartData response headers: %s", dict(chart_response.headers))
-        _LOGGER.debug("ChartData response content (first 500 chars): %s", chart_response.text[:500])
-        
-        chart_data = json.loads(chart_response.text)
+        if "login" in chart_response.url.lower() or "signin" in chart_response.url.lower():
+            raise InvalidAuth("Chart data redirected to sign in")
+        try:
+            chart_data = json.loads(chart_response.text)
+        except json.JSONDecodeError as err:
+            raise PSEGLIError("Chart data response is not JSON") from err
+        if not isinstance(chart_data, dict):
+            raise PSEGLIError("Unexpected Chart data response")
         return chart_data
 
     def _get_usage_data_sync(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, days_back: int = 0) -> Dict[str, Any]:
         """Get usage data from PSEG (synchronous)."""
         try:
-            # First check if our cookie is still valid
-            self._test_connection_sync()
-            
             # Calculate date range based on days_back parameter
             if days_back == 0:
                 # Yesterday to today (accounting for data lag)
@@ -281,12 +297,7 @@ class PSEGLIClient:
 
         except requests.exceptions.RequestException as err:
             _LOGGER.error("Failed to get usage data: %s", err)
-            raise InvalidAuth("Failed to get usage data") from err
-        except json.JSONDecodeError as err:
-            _LOGGER.error("Failed to parse JSON response: %s", err)
-            # This usually indicates an expired cookie (server returns HTML login page instead of JSON)
-            _LOGGER.error("This error typically indicates an expired authentication cookie. Please update your cookie in the PSEG integration configuration.")
-            raise InvalidAuth("Authentication cookie has expired - please update your cookie") from err
+            raise PSEGLIError("Failed to get usage data") from err
 
     async def get_usage_data(self, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None, days_back: int = 0) -> Dict[str, Any]:
         """Get usage data from PSEG (async wrapper)."""

@@ -201,7 +201,7 @@ class PSEGLIOptionsFlow(config_entries.OptionsFlow):
                     return self.async_create_entry(title="", data={})
                 
                 # If no new cookie provided, try to get one from the addon
-                elif username and password:
+                elif user_input.get("refresh_via_addon") and username and password:
                     _LOGGER.debug("No new cookie provided, attempting to get fresh cookies from addon...")
                     try:
                         mfa_method = user_input.get(CONF_MFA_METHOD, self.config_entry.data.get(CONF_MFA_METHOD, "sms"))
@@ -252,7 +252,11 @@ class PSEGLIOptionsFlow(config_entries.OptionsFlow):
                         _LOGGER.error("Failed to get cookies from addon: %s", e)
                         errors["base"] = "addon_failed"
                 else:
-                    errors["base"] = "credentials_not_found"
+                    errors["base"] = (
+                        "credentials_not_found"
+                        if user_input.get("refresh_via_addon")
+                        else "cookie_or_refresh_required"
+                    )
 
             except InvalidAuth:
                 errors["base"] = "invalid_auth"
@@ -264,9 +268,6 @@ class PSEGLIOptionsFlow(config_entries.OptionsFlow):
             step_id="init",
             data_schema=self._get_options_schema(),
             errors=errors,
-            description_placeholders={
-                "current_cookie": self.config_entry.data.get(CONF_COOKIE, "")[:50] + "..." if self.config_entry.data.get(CONF_COOKIE) else "None"
-            },
         )
 
     async def async_step_mfa(
@@ -315,10 +316,10 @@ class PSEGLIOptionsFlow(config_entries.OptionsFlow):
     def _get_options_schema(self):
         """Return the schema for the options flow."""
         return vol.Schema({
-            vol.Optional(CONF_COOKIE, description="Leave empty to attempt automatic refresh via addon"): str,
+            vol.Optional(CONF_COOKIE, description="Paste a cookie from a signed-in Smart Energy browser"): str,
+            vol.Optional("refresh_via_addon", default=False): bool,
             vol.Optional(
                 CONF_MFA_METHOD,
                 default=self.config_entry.data.get(CONF_MFA_METHOD, "sms"),
             ): vol.In(["email", "sms"]),
         })
-

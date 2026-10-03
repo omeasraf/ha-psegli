@@ -86,7 +86,7 @@ This guide will walk you through installing and configuring the PSEG Long Island
 
 The integration stores your authentication cookie and uses it for all API requests. When cookies expire:
 
-1. **Automatic Refresh**: If the automation addon is available and healthy, the integration will automatically attempt to get a new cookie
+1. **Saved Session Recovery**: If the addon has a valid browser session, the integration can refresh the cookie without a new credential login
 2. **Manual Update**: Update the cookie via **Settings** > **Devices & Services** > **PSEG Long Island** > **Configure**
 3. **Direct Input**: Manually obtain a cookie from your browser and enter it directly
 
@@ -96,7 +96,7 @@ To update your configuration:
 
 1. Go to **Settings** > **Devices & Services** > **PSEG Long Island**
 2. Click **Configure**
-3. **Update Cookie**: Enter a new cookie directly, or leave empty to attempt automatic refresh via addon
+3. **Update Cookie**: Enter a new cookie directly, or select `refresh_via_addon` to request a new browser login
 4. Click **Submit**
 
 ## Automation Addon (Optional)

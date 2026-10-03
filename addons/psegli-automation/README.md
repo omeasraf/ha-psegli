@@ -66,9 +66,11 @@ username=your_email@example.com&password=your_password
 
 ### Refresh Saved Session
 
-The integration calls this endpoint every 10 minutes. It can import the active
-Home Assistant cookie into the persistent browser profile, refresh that session,
-and return any rotated cookies without submitting credentials.
+The integration calls this endpoint every 10 minutes and when the active Smart
+Energy cookie is rejected. It can import the Home Assistant cookie into the
+persistent browser profile and return rotated cookies without submitting
+credentials. If the Smart Energy session expires, it tries the remembered My
+Account sign-in through PSEG's normal SSO handoff.
 
 ```
 POST /session/refresh
