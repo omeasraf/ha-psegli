@@ -61,6 +61,10 @@ TOTAL_COST = (
     StatisticComponent(OFF_PEAK_STATISTIC, "sensor.pseg_rate_194_off_peak"),
     StatisticComponent(ON_PEAK_STATISTIC, "sensor.pseg_rate_194_peak"),
 )
+LAST_MONTH_COST = (
+    StatisticComponent(OFF_PEAK_STATISTIC, "sensor.pseg_rate_194_last_month_off_peak"),
+    StatisticComponent(ON_PEAK_STATISTIC, "sensor.pseg_rate_194_last_month_peak"),
+)
 
 
 SENSORS = (
@@ -83,6 +87,7 @@ SENSORS = (
     PSEGPeriodSensorDescription("week_usage", "This Week Usage", "week", TOTAL),
     PSEGPeriodSensorDescription("last_week_usage", "Last Week Usage", "last_week", TOTAL),
     PSEGPeriodSensorDescription("month_usage", "This Month Usage", "month", TOTAL),
+    PSEGPeriodSensorDescription("last_month_usage", "Last Month Usage", "last_month", TOTAL),
     PSEGPeriodSensorDescription("rolling_7_day_usage", "Rolling 7-Day Usage", "rolling_7_days", TOTAL),
     PSEGPeriodSensorDescription(
         "seven_day_daily_average",
@@ -120,6 +125,7 @@ SENSORS = (
     PSEGPeriodSensorDescription("week_cost", "This Week Cost", "week", TOTAL_COST, "cost"),
     PSEGPeriodSensorDescription("last_week_cost", "Last Week Cost", "last_week", TOTAL_COST, "cost"),
     PSEGPeriodSensorDescription("month_cost", "This Month Cost", "month", TOTAL_COST, "cost"),
+    PSEGPeriodSensorDescription("last_month_cost", "Last Month Cost", "last_month", LAST_MONTH_COST, "cost"),
     PSEGPeriodSensorDescription(
         "rolling_7_day_cost",
         "Rolling 7-Day Cost",
@@ -181,6 +187,9 @@ def _period_range(period: str, now_local: datetime) -> tuple[datetime, datetime]
         return this_week - timedelta(days=7), this_week
     if period == "month":
         return today.replace(day=1), now_local
+    if period == "last_month":
+        this_month = today.replace(day=1)
+        return (this_month - timedelta(days=1)).replace(day=1), this_month
     if period == "rolling_7_days":
         return now_local - timedelta(days=7), now_local
     if period == "last_7_complete_days":
@@ -198,12 +207,14 @@ class PSEGRecorderCoordinator(DataUpdateCoordinator[dict[str, list[dict[str, Any
             name="PSEG period summaries",
             config_entry=entry,
             update_interval=SCAN_INTERVAL,
-            always_update=False,
+            # Cost sensors also depend on independently refreshed tariff states.
+            always_update=True,
         )
 
     async def _async_update_data(self) -> dict[str, list[dict[str, Any]]]:
         now_local = datetime.now(PSEG_TIMEZONE)
-        start_local = now_local - timedelta(days=45)
+        this_month = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        start_local = (this_month - timedelta(days=1)).replace(day=1) - timedelta(days=2)
         result = await get_instance(self.hass).async_add_executor_job(
             statistics_during_period,
             self.hass,
@@ -324,6 +335,19 @@ class PSEGPeriodSensor(CoordinatorEntity[PSEGRecorderCoordinator], SensorEntity)
             "period_start": start.isoformat(),
             "period_end": end.isoformat(),
         }
+        reported_hours = [
+            timestamp
+            for component in self._description.components
+            for row in self.coordinator.data.get(component.statistic_id, [])
+            if (timestamp := _row_timestamp(row.get("start"))) is not None
+            and start.astimezone(timezone.utc) <= timestamp < end.astimezone(timezone.utc)
+        ]
+        if reported_hours:
+            data_through = min(
+                max(reported_hours) + timedelta(hours=1),
+                end.astimezone(timezone.utc),
+            )
+            attributes["data_through"] = data_through.astimezone(PSEG_TIMEZONE).isoformat()
         values = self._component_values(
             start.astimezone(timezone.utc),
             end.astimezone(timezone.utc),
