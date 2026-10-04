@@ -5,6 +5,8 @@ import asyncio
 import logging
 import os
 import re
+import shutil
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
@@ -16,7 +18,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 
-from auto_login import get_fresh_cookies, PSEGAutoLogin
+from auto_login import DATA_DIR, PSEGAutoLogin
+from login_policy import LoginGate
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,18 +34,23 @@ if HEADED:
 _mfa_session: Optional[PSEGAutoLogin] = None
 _mfa_lock = asyncio.Lock()
 _browser_lock = asyncio.Lock()
+_automatic_login_gate = LoginGate(Path(DATA_DIR) / "automatic_login.json")
 
 class LoginRequest(BaseModel):
     username: str
     password: str
     mfa_code: Optional[str] = None  # If provided, used when MFA challenge appears
     mfa_method: Optional[str] = "sms"  # "email" or "sms" - which method to use for code delivery
+    force_login: bool = False
 
 class MfaRequest(BaseModel):
     code: str
 
 class SessionRefreshRequest(BaseModel):
     cookie: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    allow_login: bool = False
 
 class StatisticsTestRequest(BaseModel):
     cookie: str
@@ -53,11 +61,16 @@ class LoginResponse(BaseModel):
     cookies: Optional[str] = None
     error: Optional[str] = None
     mfa_required: Optional[bool] = None  # True when MFA needed - call POST /login/mfa with code
+    retry_after: Optional[float] = None
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "service": "psegli-automation"}
+    return {
+        "status": "healthy", "service": "psegli-automation",
+        "version": "2.5.17", "browser_mode": "headed" if HEADED else "headless",
+        "audio_dependencies_ready": bool(shutil.which("ffmpeg") and shutil.which("flac")),
+    }
 
 @app.post("/test-statistics")
 async def test_statistics(request: StatisticsTestRequest):
@@ -153,7 +166,7 @@ async def login(request: LoginRequest):
     global _mfa_session
     async with _browser_lock:
         try:
-            logger.info(f"Login attempt for user: {request.username}")
+            logger.info("Requested Smart Energy login")
         
             # Clear any stale MFA session
             if _mfa_session:
@@ -171,7 +184,7 @@ async def login(request: LoginRequest):
                 mfa_method=request.mfa_method or "sms",
                 headless=not HEADED,
             )
-            result = await cookie_getter.get_cookies()
+            result = await cookie_getter.get_cookies(force_login=request.force_login)
 
             if result == "MFA_REQUIRED":
                 _mfa_session = cookie_getter
@@ -183,6 +196,7 @@ async def login(request: LoginRequest):
                 )
         
             if result:
+                _automatic_login_gate.succeeded()
                 logger.info("Login successful, cookies obtained")
                 return LoginResponse(success=True, cookies=result)
             logger.warning("Login failed, no cookies returned")
@@ -195,7 +209,8 @@ async def login(request: LoginRequest):
 
 @app.post("/session/refresh", response_model=LoginResponse)
 async def refresh_session(request: SessionRefreshRequest):
-    """Keep the saved browser session alive without submitting credentials."""
+    """Refresh the saved session, with bounded credential recovery when requested."""
+    global _mfa_session
     if _mfa_session:
         return LoginResponse(success=False, error="MFA verification is in progress")
 
@@ -205,6 +220,22 @@ async def refresh_session(request: SessionRefreshRequest):
         if cookies:
             logger.info("Saved browser session refreshed successfully")
             return LoginResponse(success=True, cookies=cookies)
+        # A slow or unavailable website is not a reason to submit credentials.
+        signed_out = session.last_error == "Saved browser and My Account sessions are not authenticated"
+        if signed_out and request.allow_login and request.username and request.password:
+            if not _automatic_login_gate.allowed():
+                return LoginResponse(success=False, error="Automatic login is cooling down after an unsuccessful attempt", retry_after=_automatic_login_gate.retry_after())
+            _automatic_login_gate.attempted()
+            logger.info("Session expired; making one automatic Smart Energy login attempt")
+            login_session = PSEGAutoLogin(email=request.username, password=request.password, headless=not HEADED)
+            cookies = await login_session.get_cookies()
+            if cookies == "MFA_REQUIRED":
+                _mfa_session = login_session
+                return LoginResponse(success=False, mfa_required=True, error="PSEG requires a verification code")
+            if cookies:
+                _automatic_login_gate.succeeded()
+                return LoginResponse(success=True, cookies=cookies)
+            return LoginResponse(success=False, error=login_session.last_error or "Automatic login failed", retry_after=_automatic_login_gate.retry_after())
         return LoginResponse(
             success=False,
             error=session.last_error or "Saved browser session is unavailable",

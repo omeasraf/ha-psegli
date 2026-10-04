@@ -1,5 +1,5 @@
 name: "PSEG Long Island Automation"
-version: "2.5.16"
+version: "2.5.17"
 slug: "psegli-automation"
 description: "Automated login service for PSEG Long Island using Playwright"
 arch:
@@ -21,3 +21,7 @@ panel_icon: mdi:lightning-bolt
 homeassistant_api: false
 homeassistant_api_filter:
   - "psegli"
+options:
+  browser_mode: headed
+schema:
+  browser_mode: list(headed|headless)

@@ -17,7 +17,7 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -198,10 +198,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.debug("PSEG connection test successful")
         except InvalidAuth as e:
             _LOGGER.error("Authentication failed: %s", e)
-            refreshed_cookie = await refresh_saved_session(cookie)
+            refreshed_cookie = await refresh_saved_session(
+                cookie, username=username or "", password=password or "", allow_login=True
+            )
             if not refreshed_cookie:
-                raise ConfigEntryAuthFailed(
-                    "PSEG session expired; open integration options to sign in"
+                raise ConfigEntryNotReady(
+                    "PSEG session recovery is pending; automatic login retries are limited by the add-on"
                 ) from e
             cookie = refreshed_cookie
             client.update_cookie(cookie)
@@ -246,13 +248,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 
         except InvalidAuth as e:
             _LOGGER.error("Authentication failed during update: %s", e)
-            # A confirmed sign-in failure can be recovered from the saved
-            # browser profile. Never submit credentials from a polling task:
-            # repeated headless logins produce repeated CAPTCHA challenges.
+            # Recover the saved browser first. The add-on permits one credential
+            # attempt and persists a cooldown, so polling cannot flood PSEG.
             retry_after = getattr(current_client, "session_refresh_retry_after", None)
             if retry_after and datetime.now(timezone.utc) < retry_after:
                 return
-            cookies = await refresh_saved_session(current_client.cookie)
+            cookies = await refresh_saved_session(
+                current_client.cookie,
+                username=entry.data.get(CONF_USERNAME, ""),
+                password=entry.data.get(CONF_PASSWORD, ""),
+                allow_login=True,
+            )
             if not cookies:
                 current_client.session_refresh_retry_after = (
                     datetime.now(timezone.utc) + timedelta(hours=6)
@@ -263,7 +269,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "create",
                     {
                         "title": "PSEG Integration: Sign-in required",
-                        "message": "The saved PSEG session has expired. Open Settings > Devices & services > PSEG Long Island > Configure to refresh the session, or enter a cookie from your signed-in browser.",
+                        "message": "The PSEG session expired and automatic login could not complete. Further credential attempts are paused for six hours to avoid repeated challenges. Check the PSEG Automation app logs for the reason. You can also refresh through the integration's Configure screen.",
                         "notification_id": "psegli_auth_failed",
                     },
                 )
@@ -286,6 +292,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             historical_data = await current_client.get_usage_data(days_back=days_back)
             if "chart_data" in historical_data:
                 await _process_chart_data(hass, historical_data["chart_data"])
+                await hass.services.async_call(
+                    "persistent_notification", "dismiss", {"notification_id": "psegli_auth_failed"}
+                )
                 _LOGGER.info("Statistics update completed successfully after refresh")
             else:
                 _LOGGER.warning("No chart data found in response after refresh")
@@ -952,10 +961,19 @@ async def _process_chart_data(hass: HomeAssistant, chart_data: dict[str, Any]) -
 
 
 async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Update options for PSEG Long Island."""
-    # Don't reload the entire config entry - just update the data
-    # This prevents creating multiple scheduled tasks
-    _LOGGER.debug("Options updated - no reload needed")
+    """Apply a supplied cookie to the running client without duplicate timers."""
+    client = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    cookie = entry.data.get(CONF_COOKIE, "")
+    if not client or not cookie or cookie == client.cookie:
+        return
+    client.update_cookie(cookie)
+    client.session_refresh_retry_after = None
+    client.browser_keepalive_retry_after = None
+    coordinator = getattr(entry, "runtime_data", None)
+    if coordinator:
+        if coordinator.client is not client:
+            coordinator.client.update_cookie(cookie)
+        await coordinator.async_request_refresh()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

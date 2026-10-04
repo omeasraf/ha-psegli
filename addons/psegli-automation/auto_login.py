@@ -55,6 +55,7 @@ class PSEGAutoLogin:
         self.storage_state_path = STORAGE_STATE_PATH
         self.browser_profile_path = BROWSER_PROFILE_PATH
         self.last_error = None
+        self.captcha_error = None
         self.playwright = None
         self.browser = None
         self.context = None
@@ -286,6 +287,7 @@ class PSEGAutoLogin:
     def _recognize_audio(audio_bytes: bytes) -> str:
         """Convert a reCAPTCHA MP3 challenge to WAV and transcribe it."""
         recognizer = sr.Recognizer()
+        recognizer.operation_timeout = 20
         with tempfile.TemporaryDirectory() as temp_dir:
             mp3_path = os.path.join(temp_dir, "challenge.mp3")
             wav_path = os.path.join(temp_dir, "challenge.wav")
@@ -294,13 +296,59 @@ class PSEGAutoLogin:
             subprocess.run(
                 ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3_path, wav_path],
                 check=True,
+                timeout=20,
             )
             with sr.AudioFile(wav_path) as source:
                 audio = recognizer.record(source)
-        return recognizer.recognize_google(audio)
+        return recognizer.recognize_google(
+            audio, language="en-US", endpoint="https://www.google.com/speech-api/v2/recognize"
+        ).strip()
+
+    async def _save_captcha_diagnostic(self, reason: str) -> None:
+        """Save only the challenge frame, without the login form or credentials."""
+        self.captcha_error = reason
+        self.last_error = reason
+        directory = os.path.join("/config" if os.path.isdir("/config") else DATA_DIR, "psegli_diagnostics")
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            frames = self.page.locator('iframe[title*="recaptcha challenge"], iframe[src*="bframe"]')
+            for index in range(await frames.count()):
+                frame = frames.nth(index)
+                if await frame.is_visible():
+                    filename = os.path.join(directory, "last_challenge.png")
+                    await frame.screenshot(path=filename)
+                    os.chmod(filename, 0o600)
+                    break
+            filename = os.path.join(directory, "last_challenge.json")
+            with open(filename, "w", encoding="utf-8") as handle:
+                json.dump({"time": time.time(), "reason": reason}, handle)
+            os.chmod(filename, 0o600)
+        except Exception as exc:
+            _LOGGER.debug("Could not save challenge diagnostic: %s", exc)
+
+    async def _audio_challenge_state(self, frame) -> tuple[str, Optional[str]]:
+        """Distinguish an audio URL, a refusal, and a challenge still loading."""
+        text = (await frame.locator("body").inner_text()).lower()
+        if any(message in text for message in (
+            "automated queries", "try again later", "audio challenge is not available",
+            "audio challenges are not available",
+        )):
+            return "blocked", None
+        for selector, attribute in (
+            ("#audio-source", "src"),
+            (".rc-audiochallenge-tdownload-link", "href"),
+            ("audio source", "src"),
+        ):
+            element = frame.locator(selector).first
+            if await element.count():
+                value = await element.get_attribute(attribute)
+                if value:
+                    return "ready", value
+        return "loading", None
 
     async def _solve_recaptcha_audio(self) -> bool:
-        """Attempt the no-key audio challenge path using SpeechRecognition."""
+        """Transcribe offered audio and verify acceptance; stop on a refusal."""
+        self.captcha_error = None
         try:
             # Reuse an already-open challenge. Clicking the anchor again while
             # the puzzle is open can reset it before its audio controls load.
@@ -342,36 +390,51 @@ class PSEGAutoLogin:
             await audio_button.wait_for(state="visible", timeout=10000)
             await audio_button.click()
 
-            audio_link = challenge_frame.locator(
-                "#audio-source, .rc-audiochallenge-tdownload-link"
-            ).first
-            # #audio-source is often an <audio> element, which is attached but
-            # intentionally not visible. The download link is a fallback.
-            try:
-                await audio_link.wait_for(state="attached", timeout=10000)
-            except Exception:
-                # Some challenge variants use a nested <source> under <audio>.
-                source_element = challenge_frame.locator("audio source").first
-                await source_element.wait_for(state="attached", timeout=10000)
-                audio_link = source_element
-            audio_url = await audio_link.get_attribute("src") or await audio_link.get_attribute("href")
+            audio_url = None
+            for _ in range(30):
+                state, audio_url = await self._audio_challenge_state(challenge_frame)
+                if state == "blocked":
+                    await self._save_captcha_diagnostic("Google declined to provide an audio challenge (automated-query restriction)")
+                    return False
+                if audio_url:
+                    break
+                await asyncio.sleep(0.5)
             if not audio_url:
+                await self._save_captcha_diagnostic("The audio challenge did not provide an audio file")
                 return False
             audio_url = urljoin(self.page.url, audio_url)
 
-            audio_response = await self.page.request.get(audio_url)
+            audio_response = await self.page.request.get(audio_url, timeout=20000)
             if not audio_response.ok:
+                await self._save_captcha_diagnostic(f"Audio download failed (HTTP {audio_response.status})")
                 return False
             transcript = await asyncio.to_thread(
                 self._recognize_audio, await audio_response.body()
             )
+            if not transcript:
+                await self._save_captcha_diagnostic("Speech recognition returned an empty answer")
+                return False
             _LOGGER.info("🎙️ Transcribed reCAPTCHA audio challenge")
             await challenge_frame.locator("#audio-response").fill(transcript)
             await challenge_frame.locator("#recaptcha-verify-button").click()
-            await asyncio.sleep(2)
-            return True
+            for _ in range(15):
+                await asyncio.sleep(1)
+                if self._is_authenticated_dashboard(self.page.url, await self.page.content()):
+                    return True
+                anchor = next((frame for frame in self.page.frames if "api2/anchor" in frame.url), None)
+                if anchor:
+                    checkbox = anchor.locator("#recaptcha-anchor")
+                    if await checkbox.count() and await checkbox.get_attribute("aria-checked") == "true":
+                        return True
+                error = challenge_frame.locator(".rc-audiochallenge-error-message")
+                if await error.count() and await error.is_visible() and (await error.inner_text()).strip():
+                    await self._save_captcha_diagnostic("Google did not accept the transcribed audio answer")
+                    return False
+            await self._save_captcha_diagnostic("The audio answer was submitted but acceptance was not confirmed")
+            return False
         except Exception as exc:
             _LOGGER.warning("SpeechRecognition CAPTCHA solve failed; keeping manual fallback: %s", exc)
+            await self._save_captcha_diagnostic(f"Audio challenge failed at {type(exc).__name__}")
             return False
 
     async def _dismiss_access_banner(self) -> None:
@@ -428,17 +491,6 @@ class PSEGAutoLogin:
             
             # Set page timeout to be more generous for the entire process
             self.page.set_default_timeout(30000)  # 30 seconds instead of 20
-            
-            # Step 1: Start with Brave search
-            _LOGGER.info("🔍 Step 1: Navigating to Brave search...")
-            await self.page.goto(self.brave_search_url, wait_until='domcontentloaded')
-            await asyncio.sleep(random.uniform(2.0, 3.0))
-            
-            # Simulate reading search results
-            await self.page.mouse.wheel(0, random.randint(200, 500))
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-            
-            _LOGGER.info("✅ Brave search loaded")
             
             # Step 2: Open Smart Energy directly
             _LOGGER.info("🏠 Step 2: Navigating directly to PSEG Smart Energy...")
@@ -530,6 +582,7 @@ class PSEGAutoLogin:
                 max_polls = 120
                 _LOGGER.info(f"🔄 Waiting up to {max_polls}s for login response / dashboard...")
                 login_success = False
+                audio_attempted = False
                 for poll_i in range(max_polls):
                     await asyncio.sleep(1.0)
                     try:
@@ -576,28 +629,13 @@ class PSEGAutoLogin:
                         pass
 
                     if challenge_visible:
-                        if await self._solve_recaptcha_audio():
-                            continue
-                        if not self.headless:
-                            if poll_i % 10 == 0:
-                                _LOGGER.info(f"🧩 Interactive reCAPTCHA puzzle active on screen. Please solve it in the browser! ({poll_i}s elapsed)")
-                            # Do NOT abort! Continue polling so user can solve the challenge
-                            continue
-                        else:
-                            _LOGGER.error("❌ Interactive Google reCAPTCHA puzzle appeared in headless mode")
-                            self.last_error = (
-                                "Interactive reCAPTCHA puzzle appeared. Please run once in headed mode "
-                                "(e.g. 'HEADED=1 python run.py' or 'python auto_login.py --headed --email ... --password ...') "
-                                "to solve it once in a browser window and save the session."
-                            )
-                            try:
-                                with open("captcha_page_debug.html", "w", encoding="utf-8") as debug_file:
-                                    debug_file.write(page_content)
-                                await self.page.screenshot(path="captcha_challenge.png")
-                            except Exception:
-                                pass
-                            return False
-
+                        if not audio_attempted:
+                            audio_attempted = True
+                            if await self._solve_recaptcha_audio():
+                                continue
+                        self.last_error = self.captcha_error or "The CAPTCHA could not be completed automatically"
+                        _LOGGER.warning("Automatic CAPTCHA recovery stopped: %s", self.last_error)
+                        return False
                     # 3. Check for login validation error from server (e.g. wrong password)
                     error_elem = await self.page.query_selector('.field-validation-error:not(:empty), .validation-summary-errors:not(:empty)')
                     if error_elem:
@@ -1036,13 +1074,19 @@ class PSEGAutoLogin:
             _LOGGER.warning(f"Error formatting cookies for API: {e}")
             return ""
     
-    async def get_cookies(self) -> Optional[str]:
+    async def get_cookies(self, force_login: bool = False) -> Optional[str]:
         """Get cookies by following the realistic browsing pattern."""
         result = None
         try:
             if not await self.setup_browser():
                 _LOGGER.error("❌ Failed to setup browser")
                 return None
+
+            if force_login:
+                # Exercise credential recovery without invalidating the active
+                # server session still used by Home Assistant. A failed probe
+                # leaves the last successful storage_state.json intact.
+                await self.context.clear_cookies(name="MM_SID")
             
             # Follow the realistic browsing pattern
             result = await self.simulate_realistic_browsing()

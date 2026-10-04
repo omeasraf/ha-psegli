@@ -15,7 +15,7 @@ This integration uses a **two-component approach**:
 2. **Initial Login**: Addon uses Playwright when a cookie is not supplied
 3. **Cookie Management**: Addon provides fresh authentication cookies to the integration
 4. **Data Retrieval**: Integration fetches energy usage data from PSEG API
-5. **Session Recovery**: Polling reuses the current cookie and can refresh the saved browser session; a new credential login requires user action
+5. **Session Recovery**: Polling reuses the current cookie and can refresh the saved browser session; a rejected session triggers one credential login attempt, with a persistent six-hour cooldown after failure
 
 ## 📋 **Prerequisites**
 
@@ -86,7 +86,7 @@ Once configured, the integration will:
 
 With optional AddOn:
 
-- Log in to PSEG during setup or an explicit refresh request
+- Log in to PSEG during setup, explicit refresh, or bounded automatic session recovery
 - Refresh a saved browser session when the current cookie is rejected
 
 ## 🎯 **Features**
@@ -105,7 +105,7 @@ With optional AddOn:
 3. **Automated Login**: Addon uses Playwright for login and preserves the browser profile
 4. **Cookie Provision**: Addon returns valid authentication cookies
 5. **Data Fetching**: Integration uses cookies to call PSEG API
-6. **Expired Session**: If the saved session also expires, Home Assistant prompts for a manual refresh
+6. **Expired Session**: If the saved session also expires, the add-on attempts a fresh login and offered audio challenge; failures pause new login attempts for six hours
 
 ## 🐛 **Troubleshooting**
 
@@ -273,4 +273,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**Note**: The addon is optional when you provide a valid Smart Energy cookie. PSEG may require an interactive CAPTCHA during a fresh browser login; the integration does not repeatedly submit credentials while polling.
+**Note**: The addon is optional when you provide a valid Smart Energy cookie. PSEG may require a CAPTCHA during a fresh browser login. The add-on can transcribe an offered audio challenge, but cannot guarantee that Google will offer audio or accept the answer. Failed automatic logins are limited to one per six hours.

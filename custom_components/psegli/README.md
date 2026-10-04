@@ -48,8 +48,9 @@ A Home Assistant integration for monitoring energy usage from PSEG Long Island's
 The integration stores your authentication cookie and will use it for all API requests. When the cookie expires:
 
 1. **Saved Session Recovery**: If the automation addon has a valid browser session, the integration can refresh the cookie without submitting credentials
-2. **Manual Update**: You can manually update the cookie by going to **Settings** > **Devices & Services** > **PSEG Long Island** > **Configure**
-3. **Direct Cookie Input**: You can manually obtain a cookie from your browser and enter it directly
+2. **Automatic Login**: If the saved session has expired, the add-on makes a credential login attempt and tries an offered audio challenge. Failed attempts are paused for six hours, including across add-on restarts.
+3. **Manual Update**: You can manually update the cookie by going to **Settings** > **Devices & Services** > **PSEG Long Island** > **Configure**
+4. **Direct Cookie Input**: You can manually obtain a cookie from your browser and enter it directly
 
 ### Options Flow
 

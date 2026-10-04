@@ -70,7 +70,7 @@ The integration calls this endpoint every 10 minutes and when the active Smart
 Energy cookie is rejected. It can import the Home Assistant cookie into the
 persistent browser profile and return rotated cookies without submitting
 credentials. If the Smart Energy session expires, it tries the remembered My
-Account sign-in through PSEG's normal SSO handoff.
+Account sign-in through PSEG's normal SSO handoff. On confirmed sign-out, the integration also supplies `allow_login: true`, `username`, and `password` to attempt ordinary credential login. A failed attempt starts a six-hour cooldown stored in `/data`, which survives app restarts. Website timeouts do not trigger credential login.
 
 ```
 POST /session/refresh
@@ -114,7 +114,7 @@ The addon keeps the browser session alive for a few minutes after step 1, so com
 - **Browser Issues**: Check addon logs for Playwright errors
 - **Network Issues**: Verify addon can reach PSEG website
 - **MFA Required**: If login fails with "still on login page", PSEG now requires MFA - use the two-step flow above
-- **reCAPTCHA Challenge**: The addon does not bypass interactive challenges. Once a valid session exists, the persistent profile and keepalive endpoint are designed to prevent repeated fresh logins that trigger them.
+- **reCAPTCHA Challenge**: The add-on attempts an offered audio challenge using SpeechRecognition. It stops if Google refuses audio, downloads fail, or an answer is rejected. A submitted answer is not considered successful until acceptance is confirmed. Challenge-only diagnostics are saved under `/config/psegli_diagnostics`; no password or transcript is logged. Google can still require manual verification.
 
 ## Development
 
@@ -140,3 +140,9 @@ Then in another terminal:
 2. When you get the SMS code, `curl -X POST http://localhost:8000/login/mfa -H "Content-Type: application/json" -d '{"code":"123456"}'`
 
 A browser window will open so you can watch the MFA flow.
+
+## Browser mode
+
+Version 2.5.17 defaults to `browser_mode: headed`, running Chromium under Xvfb inside Home Assistant. The API remains on port 8000; the virtual display is not a remote desktop. Set the app option to `headless` to use headless Chromium. Neither mode guarantees CAPTCHA-free sign-in.
+
+For a deliberate recovery test, `POST /login` accepts `force_login: true`. It removes only the browser copy of the Smart Energy session cookie before signing in; it does not log out the active Home Assistant server session. Normal polling never uses this option.

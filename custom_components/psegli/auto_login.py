@@ -190,8 +190,10 @@ async def get_fresh_cookies(
         return None
 
 
-async def refresh_saved_session(cookie: str = "") -> Optional[str]:
-    """Keep the addon's persistent browser session alive without logging in."""
+async def refresh_saved_session(
+    cookie: str = "", *, username: str = "", password: str = "", allow_login: bool = False
+) -> Optional[str]:
+    """Refresh the saved session, optionally permitting bounded normal login."""
     base_url = await get_addon_base_url()
     if not base_url:
         logger.warning(
@@ -202,7 +204,12 @@ async def refresh_saved_session(cookie: str = "") -> Optional[str]:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{base_url}/session/refresh",
-                json={"cookie": cookie or None},
+                json={
+                    "cookie": cookie or None,
+                    "allow_login": allow_login,
+                    "username": username if allow_login else None,
+                    "password": password if allow_login else None,
+                },
                 timeout=LOGIN_TIMEOUT,
             ) as resp:
                 if resp.status != 200:
