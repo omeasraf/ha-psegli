@@ -68,7 +68,7 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy", "service": "psegli-automation",
-        "version": "2.5.18", "browser_mode": "headed" if HEADED else "headless",
+        "version": "2.5.19", "browser_mode": "headed" if HEADED else "headless",
         "audio_dependencies_ready": bool(shutil.which("ffmpeg") and shutil.which("flac")),
     }
 
