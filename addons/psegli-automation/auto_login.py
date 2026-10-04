@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import re
 import subprocess
 import tempfile
 import time
@@ -179,7 +180,7 @@ class PSEGAutoLogin:
             {
                 "name": name,
                 "value": morsel.value,
-                "domain": ".mysmartenergy.psegliny.com",
+                "domain": "mysmartenergy.psegliny.com",
                 "path": "/",
                 "secure": True,
             }
@@ -187,6 +188,13 @@ class PSEGAutoLogin:
             if name and morsel.value
         ]
         if cookies:
+            # Old imports used a domain cookie while the website sets host-only
+            # cookies. Keeping both can send two MM_SID values and later replace
+            # a renewed session with the stale copy when formatting the header.
+            for cookie in cookies:
+                await self.context.clear_cookies(
+                    name=cookie["name"], domain=re.compile(r"\.?mysmartenergy\.psegliny\.com")
+                )
             await self.context.add_cookies(cookies)
             _LOGGER.info("🍪 Imported the active Home Assistant session into the browser profile")
 
@@ -419,7 +427,12 @@ class PSEGAutoLogin:
             await challenge_frame.locator("#recaptcha-verify-button").click()
             for _ in range(15):
                 await asyncio.sleep(1)
-                if self._is_authenticated_dashboard(self.page.url, await self.page.content()):
+                try:
+                    content = await self.page.content()
+                except Exception:
+                    # The accepted answer can already be redirecting to Dashboard.
+                    continue
+                if self._is_authenticated_dashboard(self.page.url, content):
                     return True
                 anchor = next((frame for frame in self.page.frames if "api2/anchor" in frame.url), None)
                 if anchor:

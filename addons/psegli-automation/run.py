@@ -68,7 +68,7 @@ async def health_check():
     """Health check endpoint."""
     return {
         "status": "healthy", "service": "psegli-automation",
-        "version": "2.5.17", "browser_mode": "headed" if HEADED else "headless",
+        "version": "2.5.18", "browser_mode": "headed" if HEADED else "headless",
         "audio_dependencies_ready": bool(shutil.which("ffmpeg") and shutil.which("flac")),
     }
 
@@ -218,6 +218,7 @@ async def refresh_session(request: SessionRefreshRequest):
         session = PSEGAutoLogin(email="", password="", headless=not HEADED)
         cookies = await session.refresh_saved_session(request.cookie or "")
         if cookies:
+            _automatic_login_gate.succeeded()
             logger.info("Saved browser session refreshed successfully")
             return LoginResponse(success=True, cookies=cookies)
         # A slow or unavailable website is not a reason to submit credentials.

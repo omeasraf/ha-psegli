@@ -37,6 +37,23 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
         frame.locator.side_effect = lambda selector: elements.get(selector, element())
         return frame
 
+    async def test_import_replaces_both_cookie_scopes(self):
+        jar = [
+            {"name": "MM_SID", "domain": "mysmartenergy.psegliny.com", "value": "old-host"},
+            {"name": "MM_SID", "domain": ".mysmartenergy.psegliny.com", "value": "old-domain"},
+            {"name": "MM_SID", "domain": "different.example", "value": "unrelated"},
+        ]
+        async def clear(*, name, domain):
+            jar[:] = [c for c in jar if not (c["name"] == name and domain.fullmatch(c["domain"]))]
+        async def add(cookies):
+            jar.extend(cookies)
+        login = PSEGAutoLogin('', '')
+        login.context = MagicMock(clear_cookies=clear, add_cookies=add)
+        await login._seed_smart_energy_cookies('MM_SID=new-session')
+        self.assertEqual([(c["domain"], c["value"]) for c in jar], [
+            ('different.example', 'unrelated'), ('mysmartenergy.psegliny.com', 'new-session')
+        ])
+
     async def test_falls_back_when_audio_element_has_no_source(self):
         frame = self.make_frame({
             'body': element(text='Enter the words you hear'),
